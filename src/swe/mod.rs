@@ -312,7 +312,7 @@ impl SweTask {
         match language.to_lowercase().as_str() {
             "python" => {
                 map.insert("python".to_string(), "3.11".to_string());
-                map.insert("install".to_string(), "pip install -e .".to_string());
+                map.insert("install".to_string(), "pip install --break-system-packages -e . 2>&1 || pip install -e . 2>&1".to_string());
                 map.insert("test_cmd".to_string(), "pytest".to_string());
             }
             "javascript" | "typescript" | "js" | "ts" => {
@@ -321,12 +321,12 @@ impl SweTask {
                 map.insert("test_cmd".to_string(), "npm test".to_string());
             }
             "go" => {
-                map.insert("go".to_string(), "1.22".to_string());
+                map.insert("go".to_string(), "1.23".to_string());
                 map.insert("install".to_string(), "go mod download".to_string());
                 map.insert("test_cmd".to_string(), "go test ./...".to_string());
             }
             "rust" => {
-                map.insert("rust".to_string(), "1.75".to_string());
+                map.insert("rust".to_string(), "stable".to_string());
                 map.insert("install".to_string(), "cargo fetch".to_string());
                 map.insert("test_cmd".to_string(), "cargo test".to_string());
             }
@@ -347,6 +347,52 @@ impl SweTask {
             }
         }
         map
+    }
+
+    /// Generate shell commands to install the correct runtime version on a
+    /// fresh Ubuntu container.  Returns a single shell string (may be empty).
+    ///
+    /// The version is read from `install_config` version fields (go, node,
+    /// rust, python, java) and the corresponding runtime is fetched via
+    /// official release binaries or version managers.
+    pub fn runtime_install_commands(install_config: &BTreeMap<String, String>) -> String {
+        let mut cmds: Vec<String> = Vec::new();
+
+        if let Some(go_ver) = install_config.get("go") {
+            let v = if go_ver.starts_with("1.") { go_ver.as_str() } else { "1.23.0" };
+            // Normalize: "1.22" -> "1.22.0"
+            let v = if v.matches('.').count() == 1 { format!("{v}.0") } else { v.to_string() };
+            cmds.push(format!(
+                "rm -rf /usr/local/go && \
+                 curl -fsSL https://go.dev/dl/go{v}.linux-amd64.tar.gz | tar -C /usr/local -xzf - && \
+                 export PATH=/usr/local/go/bin:$PATH"
+            ));
+        }
+
+        if let Some(node_ver) = install_config.get("node") {
+            let v = node_ver.trim();
+            cmds.push(format!(
+                "curl -fsSL https://deb.nodesource.com/setup_{v}.x | bash - && \
+                 apt-get install -y nodejs"
+            ));
+        }
+
+        if let Some(_rust_ver) = install_config.get("rust") {
+            cmds.push(
+                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+                 export PATH=$HOME/.cargo/bin:$PATH".to_string()
+            );
+        }
+
+        if let Some(java_ver) = install_config.get("java") {
+            let v = java_ver.trim();
+            cmds.push(format!(
+                "apt-get update -qq && apt-get install -y -qq openjdk-{v}-jdk 2>/dev/null || \
+                 apt-get install -y -qq default-jdk"
+            ));
+        }
+
+        cmds.join(" && ")
     }
 }
 

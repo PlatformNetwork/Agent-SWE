@@ -341,6 +341,16 @@ async fn evaluate_task(task: &SweTask, config: &HarnessConfig) -> HarnessResult 
         }
     }
 
+    // Install language runtime from install_config version fields
+    let runtime_cmds = SweTask::runtime_install_commands(&task.install_config);
+    if !runtime_cmds.is_empty() {
+        info!(task_id = %task.id, "Installing runtime: {}", truncate(&runtime_cmds, 120));
+        let (code, _, err) = docker_exec(&cname, &format!("{} 2>&1", runtime_cmds), 300).await;
+        if code != 0 {
+            warn!(task_id = %task.id, "Runtime install failed (continuing): {}", truncate(&err, 200));
+        }
+    }
+
     // Install project deps from install_config
     if let Some(install_cmd) = task.install_config.get("install") {
         if !install_cmd.is_empty() {
