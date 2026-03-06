@@ -31,6 +31,7 @@ pub fn swe_bench_schema() -> Schema {
         Field::new("PASS_TO_PASS", DataType::Utf8, false),
         Field::new("environment_setup_commit", DataType::Utf8, true),
         // swe-forge extensions
+        Field::new("install", DataType::Utf8, true),
         Field::new("language", DataType::Utf8, false),
         Field::new("difficulty", DataType::Utf8, false),
         Field::new("difficulty_score", DataType::UInt8, false),
@@ -54,6 +55,7 @@ pub fn tasks_to_record_batch(tasks: &[SweTask]) -> anyhow::Result<RecordBatch> {
     let mut fail_to_pass = StringBuilder::new();
     let mut pass_to_pass = StringBuilder::new();
     let mut env_setup_commit = StringBuilder::new();
+    let mut install = StringBuilder::new();
     let mut language = StringBuilder::new();
     let mut difficulty = StringBuilder::new();
     let mut difficulty_score = UInt8Builder::new();
@@ -103,6 +105,13 @@ pub fn tasks_to_record_batch(tasks: &[SweTask]) -> anyhow::Result<RecordBatch> {
             env_setup_commit.append_value(&env_commit);
         }
 
+        let install_cmd = task.install_config.get("install").cloned().unwrap_or_default();
+        if install_cmd.is_empty() {
+            install.append_null();
+        } else {
+            install.append_value(&install_cmd);
+        }
+
         language.append_value(&task.language);
 
         let diff_label =
@@ -136,6 +145,7 @@ pub fn tasks_to_record_batch(tasks: &[SweTask]) -> anyhow::Result<RecordBatch> {
         Arc::new(fail_to_pass.finish()),
         Arc::new(pass_to_pass.finish()),
         Arc::new(env_setup_commit.finish()),
+        Arc::new(install.finish()),
         Arc::new(language.finish()),
         Arc::new(difficulty.finish()),
         Arc::new(difficulty_score.finish()),
@@ -239,6 +249,7 @@ pub fn read_parquet(input_path: &Path) -> anyhow::Result<Vec<SweTask>> {
         let created_ats = get_string("created_at");
         let fail_to_passes = get_string("FAIL_TO_PASS");
         let pass_to_passes = get_string("PASS_TO_PASS");
+        let installs = get_string("install");
         let languages = get_string("language");
         let difficulties = get_string("difficulty");
 
@@ -311,6 +322,12 @@ pub fn read_parquet(input_path: &Path) -> anyhow::Result<Vec<SweTask>> {
                 task.meta.insert("difficulty".to_string(), d.clone());
             }
 
+            if let Some(ref inst) = installs[i] {
+                if !inst.is_empty() {
+                    task.install_config.insert("install".to_string(), inst.clone());
+                }
+            }
+
             tasks.push(task);
         }
     }
@@ -342,6 +359,8 @@ mod tests {
         task.pass_to_pass = vec!["pytest tests/test_x.py::test_other".to_string()];
         task.meta
             .insert("difficulty".to_string(), "medium".to_string());
+        task.install_config
+            .insert("install".to_string(), "pip install -e .".to_string());
         task
     }
 
@@ -354,7 +373,7 @@ mod tests {
         assert!(schema.field_with_name("PASS_TO_PASS").is_ok());
         assert!(schema.field_with_name("difficulty").is_ok());
         assert!(schema.field_with_name("quality_score").is_ok());
-        assert_eq!(schema.fields().len(), 16);
+        assert_eq!(schema.fields().len(), 17);
     }
 
     #[test]
@@ -362,7 +381,7 @@ mod tests {
         let tasks = vec![make_test_task("task-001"), make_test_task("task-002")];
         let batch = tasks_to_record_batch(&tasks).unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 16);
+        assert_eq!(batch.num_columns(), 17);
     }
 
     #[test]
@@ -380,6 +399,10 @@ mod tests {
         assert_eq!(loaded[0].language, "python");
         assert_eq!(loaded[0].difficulty_score, 2);
         assert_eq!(loaded[0].fail_to_pass.len(), 1);
+        assert_eq!(
+            loaded[0].install_config.get("install").map(|s| s.as_str()),
+            Some("pip install -e .")
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }

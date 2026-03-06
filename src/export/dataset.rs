@@ -331,6 +331,8 @@ dataset_info:
       dtype: string
     - name: environment_setup_commit
       dtype: string
+    - name: install
+      dtype: string
     - name: language
       dtype: string
     - name: difficulty
@@ -366,6 +368,7 @@ with additional fields for multi-language support, difficulty scoring, and quali
 | `FAIL_TO_PASS` | string | JSON list of tests that must pass after fix |
 | `PASS_TO_PASS` | string | JSON list of regression tests |
 | `environment_setup_commit` | string | Commit for environment setup |
+| `install` | string | Verified install commands for environment setup |
 | `language` | string | Primary programming language |
 | `difficulty` | string | Difficulty level (easy/medium/hard) |
 | `difficulty_score` | uint8 | Numeric difficulty (1=easy, 2=medium, 3=hard) |
