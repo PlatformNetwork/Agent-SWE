@@ -505,13 +505,22 @@ struct ApiChoice {
     finish_reason: Option<String>,
 }
 
+/// Deserializes a JSON `null` (or missing field) into an empty `String`.
+fn deserialize_null_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 /// Internal message structure from the API response.
 /// Supports reasoning models that may include reasoning_content/reasoning.
 #[derive(Debug, Deserialize)]
 struct ApiMessage {
     role: String,
     /// The main content - may be empty for reasoning models or tool calls.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     content: String,
     /// Reasoning text from reasoning models (e.g., Kimi K2.5, DeepSeek R1).
     #[serde(default)]

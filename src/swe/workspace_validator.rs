@@ -31,8 +31,11 @@ const MAX_FRESH_CYCLES: usize = 5;
 /// Maximum agent turns for install exploration.
 const MAX_INSTALL_AGENT_TURNS: usize = 200;
 
+/// Maximum agent turns for verification (more focused than install agent).
+const MAX_VERIFY_AGENT_TURNS: usize = 100;
+
 /// Default model for the install agent (overridden by SWE_FORGE_INSTALL_MODEL env var).
-const DEFAULT_INSTALL_MODEL: &str = "openai/gpt-4.1-mini";
+const DEFAULT_INSTALL_MODEL: &str = "openai/gpt-5.3-codex";
 
 const INSTALL_AGENT_SYSTEM_PROMPT: &str = r#"You are a DevOps agent. Your job is to install all dependencies for a software project in a fresh Docker container (python:3.12-slim with only git and python3 pre-installed).
 
@@ -69,11 +72,104 @@ IMPORTANT:
 - Include runtime installation (Node, Go, Rust, Java) if needed.
 - Do NOT include exploratory commands (ls, cat, etc.) -- only install commands."#;
 
+const VERIFY_AGENT_SYSTEM_PROMPT: &str = r#"You are a verification agent. Your job is to verify and fix install + test commands for a software project in a fresh Docker container (python:3.12-slim with only git and python3 pre-installed).
+
+You have these tools:
+- `shell`: Execute shell commands freely (for exploration and debugging)
+- `read_file`: Read file contents
+- `list_dir`: List directory contents
+- `grep_files`: Search files with regex
+- `search_files`: Find files by glob pattern
+- `verify_command`: Execute a command and verify it succeeds/fails as expected. Returns structured result.
+- `submit_verified_install`: Submit verified install commands after all checks pass.
+
+CONTEXT:
+- Install commands to verify: {install_commands}
+- Test commands (fail_to_pass, must FAIL on base): {f2p}
+- Test commands (pass_to_pass, must PASS on base): {p2p}
+- Test files have been written to the container.
+
+WORKFLOW:
+1. Run each install command via `verify_command` and verify they all succeed (exit 0).
+   If any fails, diagnose via `shell`, fix the command, and re-run.
+
+2. After install, verify test tools are available:
+   - For Python projects: `verify_command("which pytest || which python3 -m pytest", expect_success=true)`
+   - For JS projects: `verify_command("which npm && which npx", expect_success=true)`
+   - For Rust: `verify_command("which cargo", expect_success=true)`
+   If test tools are missing, install them (e.g. `pip install --break-system-packages pytest`) and add to install_commands.
+
+3. Verify each fail_to_pass test:
+   `verify_command(cmd, expect_success=false)` -- must FAIL (exit != 0) on base commit.
+   If it fails with "command not found" instead of a test failure, the tool is missing -- fix install.
+
+4. Verify each pass_to_pass test:
+   `verify_command(cmd, expect_success=true)` -- must PASS (exit 0) on base commit.
+   If it fails with "command not found", fix install.
+
+5. Once ALL verifications pass, call `submit_verified_install` with the complete, corrected install commands.
+
+IMPORTANT:
+- "command not found" errors mean the tool is NOT installed. Fix this by adding apt-get/pip install commands.
+- Install commands must be complete and self-contained for a fresh container.
+- Include `--break-system-packages` for pip commands on Python 3.12+.
+- Common missing tools: pytest, tox, nox, coverage, mypy, black, flake8, eslint, jest, mocha.
+- When a test fails with "No module named X", add `pip install --break-system-packages X` to install commands."#;
+
 /// Result of workspace validation.
 #[derive(Debug, Clone)]
 pub enum ValidationOutcome {
     Passed,
     Rejected { reason: String },
+}
+
+// ── Verification tool definitions ─────────────────────────────────────────
+
+fn verify_command_tool() -> ToolDefinition {
+    ToolDefinition::function(
+        "verify_command",
+        "Execute a command and verify it succeeds/fails as expected. Returns structured result with exit_code, passed, stdout, stderr.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute and verify"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Timeout in ms (default: 120000)"
+                },
+                "expect_success": {
+                    "type": "boolean",
+                    "description": "Whether the command should succeed (exit 0) or fail (exit != 0)"
+                }
+            },
+            "required": ["command"]
+        }),
+    )
+}
+
+fn submit_verified_install_tool() -> ToolDefinition {
+    ToolDefinition::function(
+        "submit_verified_install",
+        "Submit verified install commands after all checks pass. Only call this after verifying install AND test commands.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "install_commands": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Complete install commands verified in this fresh container"
+                },
+                "test_tools_verified": {
+                    "type": "boolean",
+                    "description": "Whether test runner tools (pytest, npm test, cargo test, etc.) were verified to be available after install"
+                }
+            },
+            "required": ["install_commands", "test_tools_verified"]
+        }),
+    )
 }
 
 /// Pre-export workspace validator.
@@ -142,6 +238,11 @@ impl WorkspaceValidator {
                     let combined = cmds.join(" && ");
                     task.install_config
                         .insert("install".to_string(), combined);
+                    // Remove runtime version keys -- the install agent includes
+                    // runtime setup in its commands already.
+                    for key in &["go", "node", "rust", "java"] {
+                        task.install_config.remove(*key);
+                    }
                     task.meta
                         .insert("install_source".to_string(), "llm-install-agent".to_string());
                     tracing::info!(task_id = %task.id, "Install agent succeeded");
@@ -478,7 +579,8 @@ impl WorkspaceValidator {
     // ── Fresh-container replay ────────────────────────────────────────────
 
     /// Replay install + tests in brand-new containers, up to MAX_FRESH_CYCLES times.
-    /// If install or tests fail, the agent gets another shot to fix the commands.
+    /// Uses an agentic verification approach: an LLM agent diagnoses and fixes
+    /// install/test failures, then a final blind replay confirms correctness.
     async fn fresh_container_revalidation(
         &self,
         task: &mut SweTask,
@@ -489,7 +591,76 @@ impl WorkspaceValidator {
                 "Starting fresh-container replay cycle"
             );
 
-            let sandbox = match DockerSandbox::start(
+            // ── Step 1: Verification agent in a fresh container ───────────
+            if let Some(ref llm) = self.llm {
+                let verify_sandbox = match DockerSandbox::start(
+                    &task.repo,
+                    &task.base_commit,
+                    &task.language,
+                    self.image_override.as_deref(),
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Ok(ValidationOutcome::Rejected {
+                            reason: format!(
+                                "Fresh replay cycle {}: verify container start failed: {e}",
+                                cycle + 1
+                            ),
+                        });
+                    }
+                };
+
+                // Copy test files before handing off to the verify agent
+                if let Some(test_files_json) = task.meta.get("test_files") {
+                    if let Ok(files) = serde_json::from_str::<Vec<TestFile>>(test_files_json) {
+                        for tf in &files {
+                            let _ = verify_sandbox.write_file(&tf.path, &tf.content).await;
+                        }
+                    }
+                }
+
+                match self.run_verify_agent(&verify_sandbox, task, llm).await {
+                    Ok(new_cmds) if !new_cmds.is_empty() => {
+                        let combined = new_cmds.join(" && ");
+                        task.install_config
+                            .insert("install".to_string(), combined);
+                        // Remove runtime version keys so replay_install doesn't
+                        // run conflicting runtime_install_commands -- the verify
+                        // agent already includes runtime setup in its commands.
+                        for key in &["go", "node", "rust", "java"] {
+                            task.install_config.remove(*key);
+                        }
+                        task.meta.insert(
+                            "install_source".to_string(),
+                            "llm-verify-agent".to_string(),
+                        );
+                        tracing::info!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Verify agent submitted corrected install commands"
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Verify agent returned empty commands, keeping existing"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            error = %e,
+                            "Verify agent errored, keeping existing commands"
+                        );
+                    }
+                }
+
+                verify_sandbox.destroy().await;
+            }
+
+            // ── Step 2: Final blind replay in a brand-new container ───────
+            let confirm_sandbox = match DockerSandbox::start(
                 &task.repo,
                 &task.base_commit,
                 &task.language,
@@ -500,45 +671,21 @@ impl WorkspaceValidator {
                 Ok(s) => s,
                 Err(e) => {
                     return Ok(ValidationOutcome::Rejected {
-                        reason: format!("Fresh replay cycle {}: container start failed: {e}", cycle + 1),
+                        reason: format!(
+                            "Fresh replay cycle {}: confirm container start failed: {e}",
+                            cycle + 1
+                        ),
                     });
                 }
             };
 
-            // Replay install commands from scratch
-            let install_ok = self.replay_install(&sandbox, task).await;
+            let install_ok = self.replay_install(&confirm_sandbox, task).await;
             if !install_ok {
-                // Agent gets another shot to fix in this (still running) container
-                if let Some(ref llm) = self.llm {
-                    tracing::warn!(
-                        task_id = %task.id, cycle = cycle + 1,
-                        "Install replay failed, running agent to fix"
-                    );
-                    match self.run_install_agent(&sandbox, task, llm).await {
-                        Ok(new_cmds) if !new_cmds.is_empty() => {
-                            let combined = new_cmds.join(" && ");
-                            task.install_config
-                                .insert("install".to_string(), combined);
-                            task.meta
-                                .insert("install_source".to_string(), "llm-install-agent-fix".to_string());
-                            sandbox.destroy().await;
-                            continue; // retry with new commands
-                        }
-                        _ => {
-                            sandbox.destroy().await;
-                            continue;
-                        }
-                    }
-                }
-                sandbox.destroy().await;
-                if cycle + 1 == MAX_FRESH_CYCLES {
-                    return Ok(ValidationOutcome::Rejected {
-                        reason: format!(
-                            "Install failed after {} fresh-container cycles",
-                            MAX_FRESH_CYCLES,
-                        ),
-                    });
-                }
+                tracing::warn!(
+                    task_id = %task.id, cycle = cycle + 1,
+                    "Blind replay install failed after verify agent, retrying"
+                );
+                confirm_sandbox.destroy().await;
                 continue;
             }
 
@@ -546,26 +693,25 @@ impl WorkspaceValidator {
             if let Some(test_files_json) = task.meta.get("test_files") {
                 if let Ok(files) = serde_json::from_str::<Vec<TestFile>>(test_files_json) {
                     for tf in &files {
-                        let _ = sandbox.write_file(&tf.path, &tf.content).await;
+                        let _ = confirm_sandbox.write_file(&tf.path, &tf.content).await;
                     }
                 }
             }
 
-            // Run all tests
-            let tests_ok = self.run_all_tests(&sandbox, task).await;
-            sandbox.destroy().await;
+            let tests_ok = self.run_all_tests(&confirm_sandbox, task).await;
+            confirm_sandbox.destroy().await;
 
             if tests_ok {
                 tracing::info!(
                     task_id = %task.id, cycle = cycle + 1,
-                    "Workspace validation PASSED (fresh replay)"
+                    "Workspace validation PASSED (fresh replay confirmed)"
                 );
                 return Ok(ValidationOutcome::Passed);
             }
 
             tracing::warn!(
                 task_id = %task.id, cycle = cycle + 1,
-                "Tests failed on fresh container, retrying"
+                "Blind replay tests failed after verify agent, retrying"
             );
         }
 
@@ -575,6 +721,239 @@ impl WorkspaceValidator {
                 MAX_FRESH_CYCLES,
             ),
         })
+    }
+
+    // ── Verify agent ──────────────────────────────────────────────────────
+
+    /// Run an LLM verification agent that diagnoses and fixes install + test
+    /// commands in a fresh container. Returns corrected install commands.
+    async fn run_verify_agent(
+        &self,
+        sandbox: &DockerSandbox,
+        task: &mut SweTask,
+        llm: &Arc<dyn LlmProvider>,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        let existing_install = task
+            .install_config
+            .get("install")
+            .cloned()
+            .unwrap_or_default();
+
+        // Split existing install commands for the prompt
+        let install_cmds_display = if existing_install.is_empty() {
+            "(none)".to_string()
+        } else {
+            existing_install.clone()
+        };
+
+        let f2p_display = if task.fail_to_pass.is_empty() {
+            "(none)".to_string()
+        } else {
+            task.fail_to_pass.join("\n  ")
+        };
+
+        let p2p_display = if task.pass_to_pass.is_empty() {
+            "(none)".to_string()
+        } else {
+            task.pass_to_pass.join("\n  ")
+        };
+
+        // Build the system prompt with task details substituted
+        let system_prompt = VERIFY_AGENT_SYSTEM_PROMPT
+            .replace("{install_commands}", &install_cmds_display)
+            .replace("{f2p}", &f2p_display)
+            .replace("{p2p}", &p2p_display);
+
+        let user_msg = format!(
+            "Repository: {repo}\n\
+             Language: {lang}\n\
+             The repo is cloned at /repo on the base commit. \
+             Test files have been written. \
+             Verify the install commands, then verify the test commands, fix any issues, \
+             and submit the corrected install commands via `submit_verified_install`.",
+            repo = task.repo,
+            lang = task.language,
+        );
+
+        let tools = vec![
+            sandbox_tools::shell_tool(),
+            sandbox_tools::read_file_tool(),
+            sandbox_tools::list_dir_tool(),
+            sandbox_tools::grep_files_tool(),
+            sandbox_tools::search_files_tool(),
+            verify_command_tool(),
+            submit_verified_install_tool(),
+        ];
+
+        let mut messages = vec![
+            Message::system(system_prompt),
+            Message::user(user_msg),
+        ];
+
+        for turn in 0..MAX_VERIFY_AGENT_TURNS {
+            let request = GenerationRequest {
+                model: install_model(),
+                messages: messages.clone(),
+                temperature: Some(0.2),
+                max_tokens: Some(2000),
+                top_p: None,
+                response_format: None,
+                tools: Some(tools.clone()),
+                tool_choice: Some(ToolChoice::Mode("auto".to_string())),
+            };
+
+            let response = llm.generate(request).await?;
+            let choice = match response.choices.first() {
+                Some(c) => c.clone(),
+                None => break,
+            };
+
+            if let Some(ref tool_calls) = choice.message.tool_calls {
+                messages.push(Message::assistant_with_tool_calls(
+                    choice.message.content.clone(),
+                    tool_calls.clone(),
+                ));
+
+                for tc in tool_calls {
+                    match tc.function.name.as_str() {
+                        "verify_command" => {
+                            #[derive(serde::Deserialize)]
+                            struct VerifyArgs {
+                                command: String,
+                                #[serde(default = "default_verify_timeout")]
+                                timeout_ms: u64,
+                                #[serde(default = "default_expect_success")]
+                                expect_success: bool,
+                            }
+                            fn default_verify_timeout() -> u64 {
+                                120_000
+                            }
+                            fn default_expect_success() -> bool {
+                                true
+                            }
+
+                            match serde_json::from_str::<VerifyArgs>(&tc.function.arguments) {
+                                Ok(args) => {
+                                    let result = sandbox
+                                        .exec(
+                                            &format!("cd /repo && {}", args.command),
+                                            args.timeout_ms,
+                                        )
+                                        .await;
+
+                                    let passed = if args.expect_success {
+                                        result.exit_code == 0
+                                    } else {
+                                        result.exit_code != 0
+                                    };
+
+                                    tracing::debug!(
+                                        task_id = %task.id, turn = turn,
+                                        cmd = %args.command,
+                                        exit = result.exit_code,
+                                        expect_success = args.expect_success,
+                                        passed = passed,
+                                        "Verify agent: verify_command"
+                                    );
+
+                                    let response_text = format!(
+                                        "exit_code: {}\npassed: {}\nstdout:\n{}\nstderr:\n{}",
+                                        result.exit_code,
+                                        passed,
+                                        truncate_str(&result.stdout, 3000),
+                                        truncate_str(&result.stderr, 1500),
+                                    );
+                                    messages.push(Message::tool_result(&tc.id, response_text));
+                                }
+                                Err(e) => {
+                                    messages.push(Message::tool_result(
+                                        &tc.id,
+                                        format!("Invalid verify_command args: {}", e),
+                                    ));
+                                }
+                            }
+                        }
+                        "submit_verified_install" => {
+                            #[derive(serde::Deserialize)]
+                            struct SubmitVerifiedArgs {
+                                #[serde(default)]
+                                install_commands: Vec<String>,
+                                #[serde(default)]
+                                test_tools_verified: bool,
+                            }
+
+                            match serde_json::from_str::<SubmitVerifiedArgs>(
+                                &tc.function.arguments,
+                            ) {
+                                Ok(args) => {
+                                    if args.install_commands.is_empty() {
+                                        messages.push(Message::tool_result(
+                                            &tc.id,
+                                            "REJECTED: install_commands must not be empty. \
+                                             Verify install and test commands first, then submit."
+                                                .to_string(),
+                                        ));
+                                        continue;
+                                    }
+                                    if !args.test_tools_verified {
+                                        messages.push(Message::tool_result(
+                                            &tc.id,
+                                            "WARNING: test_tools_verified is false. \
+                                             Please verify test tools are available before submitting. \
+                                             If you are sure they work, set test_tools_verified=true."
+                                                .to_string(),
+                                        ));
+                                        continue;
+                                    }
+                                    tracing::info!(
+                                        task_id = %task.id,
+                                        turn = turn,
+                                        cmds = args.install_commands.len(),
+                                        test_tools_verified = args.test_tools_verified,
+                                        "Verify agent submitted corrected commands"
+                                    );
+                                    return Ok(args.install_commands);
+                                }
+                                Err(e) => {
+                                    messages.push(Message::tool_result(
+                                        &tc.id,
+                                        format!("Invalid submit_verified_install args: {}", e),
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Delegate to shared tool dispatch (shell, read_file, etc.)
+                            let output = dispatch_tool(tc, sandbox, &task.id, turn).await;
+                            let text = match output {
+                                ToolOutput::Text(s) => s,
+                                ToolOutput::Error(s) => s,
+                            };
+                            messages.push(Message::tool_result(&tc.id, text));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // No tool calls -- nudge the agent
+            if !choice.message.content.trim().is_empty() {
+                messages.push(Message::assistant(choice.message.content.clone()));
+                messages.push(Message::user(
+                    "Use `verify_command` to check each install command and test command, \
+                     fix any issues with `shell`, then call `submit_verified_install`.",
+                ));
+                continue;
+            }
+
+            break;
+        }
+
+        anyhow::bail!(
+            "Verify agent failed for {}: exhausted {} turns",
+            task.id,
+            MAX_VERIFY_AGENT_TURNS
+        )
     }
 
     /// Replay the recorded install commands on a fresh container.

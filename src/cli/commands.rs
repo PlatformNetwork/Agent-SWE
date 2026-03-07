@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Default model to use for generation.
-const DEFAULT_MODEL: &str = "openai/gpt-5.2-codex:nitro";
+const DEFAULT_MODEL: &str = "openai/gpt-5.3-codex";
 
 /// Default output directory for generated datasets.
 const DEFAULT_OUTPUT_DIR: &str = "./generated-datasets";
@@ -104,6 +104,9 @@ pub enum SweSubcommand {
 
     /// Run a benchmark on N PRs and output detailed pipeline metrics as JSON.
     Benchmark(SweBenchmarkArgs),
+
+    /// Fix broken tasks: verify and repair install/test commands in existing workspace.yaml files.
+    FixTasks(SweFixTasksArgs),
 }
 
 /// Arguments for `swe_forge swe mine`.
@@ -258,6 +261,42 @@ pub struct SweBenchmarkArgs {
     /// Override deep processing backlog multiplier (default: 5).
     #[arg(long)]
     pub backlog_multiplier: Option<usize>,
+}
+
+/// Arguments for `swe_forge swe fix-tasks`.
+#[derive(Parser, Debug)]
+pub struct SweFixTasksArgs {
+    /// Directory containing task subdirectories with workspace.yaml files.
+    #[arg(short = 'i', long, default_value = DEFAULT_SWE_OUTPUT_DIR)]
+    pub input: String,
+
+    /// LLM model to use for the verification agent.
+    #[arg(short = 'm', long, default_value = DEFAULT_MODEL)]
+    pub model: String,
+
+    /// OpenRouter API key (can also be set via OPENROUTER_API_KEY or LITELLM_API_KEY env var).
+    #[arg(long, env = "OPENROUTER_API_KEY")]
+    pub api_key: Option<String>,
+
+    /// Override Docker image for validation containers.
+    #[arg(long)]
+    pub image: Option<String>,
+
+    /// Number of concurrent task fixes (each needs a Docker container).
+    #[arg(long, default_value = "1")]
+    pub parallel: usize,
+
+    /// Only fix a specific task by ID.
+    #[arg(long)]
+    pub task_id: Option<String>,
+
+    /// Dry run: check tasks but don't write fixes.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output JSON summary.
+    #[arg(short = 'j', long)]
+    pub json: bool,
 }
 
 /// Arguments for `swe_forge swe validate`.
@@ -513,6 +552,301 @@ async fn run_swe_command(args: SweArgs) -> anyhow::Result<()> {
         SweSubcommand::Harness(args) => run_swe_harness_command(args).await,
         SweSubcommand::Load(args) => run_swe_load_command(args).await,
         SweSubcommand::Benchmark(args) => run_swe_benchmark_command(args).await,
+        SweSubcommand::FixTasks(args) => run_swe_fix_tasks_command(args).await,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FixTaskResult {
+    task_id: String,
+    repo: String,
+    status: String, // "fixed", "ok", "failed", "skipped"
+    original_install: String,
+    fixed_install: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FixTasksOutput {
+    status: String,
+    total: usize,
+    ok: usize,
+    fixed: usize,
+    failed: usize,
+    skipped: usize,
+    results: Vec<FixTaskResult>,
+}
+
+async fn run_swe_fix_tasks_command(args: SweFixTasksArgs) -> anyhow::Result<()> {
+    let input_dir = Path::new(&args.input);
+    if !input_dir.exists() {
+        return Err(anyhow::anyhow!(
+            "Input directory does not exist: {}",
+            args.input
+        ));
+    }
+
+    let llm_client = build_llm_client(args.api_key, args.model).await?;
+    let validator = crate::swe::WorkspaceValidator::new(args.image.clone(), Some(llm_client));
+
+    // Discover all workspace.yaml files
+    let mut task_dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    // Recursively discover all workspace.yaml files.
+    // Supports: flat (dir/workspace.yaml), nested (dir/task-id/workspace.yaml),
+    // and HuggingFace layout (dir/tasks/org/task-id/workspace.yaml).
+    fn discover_workspace_dirs(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    if p.join("workspace.yaml").exists() {
+                        out.push(p);
+                    } else {
+                        discover_workspace_dirs(&p, out);
+                    }
+                }
+            }
+        }
+    }
+
+    discover_workspace_dirs(input_dir, &mut task_dirs);
+
+    // Filter by task_id if specified (match against the task id from workspace.yaml dirname
+    // or the full relative path from input_dir)
+    if let Some(ref filter_id) = args.task_id {
+        task_dirs.retain(|p| {
+            let dir_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let rel = p.strip_prefix(input_dir)
+                .map(|r| r.to_string_lossy().to_string())
+                .unwrap_or_default();
+            dir_name == filter_id.as_str()
+                || rel.contains(filter_id.as_str())
+        });
+    }
+
+    task_dirs.sort();
+
+    if task_dirs.is_empty() {
+        if args.json {
+            println!(
+                r#"{{"status":"empty","total":0,"ok":0,"fixed":0,"failed":0,"skipped":0,"results":[]}}"#
+            );
+        } else {
+            println!("No workspace.yaml files found in {}", args.input);
+        }
+        return Ok(());
+    }
+
+    let parallel = args.parallel.max(1);
+    let dry_run = args.dry_run;
+    info!(count = task_dirs.len(), parallel = parallel, "Found tasks to check");
+
+    let validator = Arc::new(validator);
+
+    // Process tasks in parallel chunks
+    let mut results: Vec<FixTaskResult> = Vec::new();
+
+    for chunk in task_dirs.chunks(parallel) {
+        let mut handles = Vec::new();
+        for task_dir in chunk {
+            let task_dir = task_dir.clone();
+            let validator = Arc::clone(&validator);
+            handles.push(tokio::spawn(async move {
+                fix_single_task(&task_dir, &validator, dry_run).await
+            }));
+        }
+        for handle in handles {
+            match handle.await {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    results.push(FixTaskResult {
+                        task_id: "unknown".to_string(),
+                        repo: String::new(),
+                        status: "failed".to_string(),
+                        original_install: String::new(),
+                        fixed_install: None,
+                        error: Some(format!("Task panicked: {}", e)),
+                    });
+                }
+            }
+        }
+        // Log progress after each chunk
+        let done = results.len();
+        let total = task_dirs.len();
+        let ok = results.iter().filter(|r| r.status == "ok").count();
+        let fixed = results.iter().filter(|r| r.status == "fixed").count();
+        let failed = results.iter().filter(|r| r.status == "failed").count();
+        info!(done = done, total = total, ok = ok, fixed = fixed, failed = failed, "Progress");
+    }
+
+    let ok_count = results.iter().filter(|r| r.status == "ok").count();
+    let fixed_count = results.iter().filter(|r| r.status == "fixed").count();
+    let failed_count = results.iter().filter(|r| r.status == "failed").count();
+    let skipped_count = results.iter().filter(|r| r.status == "skipped").count();
+
+    let output = FixTasksOutput {
+        status: if failed_count == 0 {
+            "success".to_string()
+        } else {
+            "partial".to_string()
+        },
+        total: results.len(),
+        ok: ok_count,
+        fixed: fixed_count,
+        failed: failed_count,
+        skipped: skipped_count,
+        results: results.clone(),
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("\n=== Fix Tasks Results ===");
+        println!("Total:   {}", output.total);
+        println!("OK:      {} (already working)", ok_count);
+        println!("Fixed:   {} (install commands updated)", fixed_count);
+        println!("Failed:  {} (could not fix)", failed_count);
+        println!("Skipped: {} (parse/read error)", skipped_count);
+
+        if !args.dry_run && fixed_count > 0 {
+            println!("\n{} workspace.yaml files were updated.", fixed_count);
+        } else if args.dry_run && fixed_count > 0 {
+            println!(
+                "\n[DRY RUN] {} tasks would be fixed. Run without --dry-run to apply.",
+                fixed_count
+            );
+        }
+
+        for r in &results {
+            let icon = match r.status.as_str() {
+                "ok" => "[OK]",
+                "fixed" => "[FIXED]",
+                "failed" => "[FAIL]",
+                "skipped" => "[SKIP]",
+                _ => "[?]",
+            };
+            println!("  {} {} ({})", icon, r.task_id, r.repo);
+            if let Some(ref err) = r.error {
+                println!("       {}", err);
+            }
+            if let Some(ref fixed) = r.fixed_install {
+                println!(
+                    "       install: {} -> {}",
+                    truncate_for_display(&r.original_install, 60),
+                    truncate_for_display(fixed, 60)
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn truncate_for_display(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
+}
+
+async fn fix_single_task(
+    task_dir: &Path,
+    validator: &crate::swe::WorkspaceValidator,
+    dry_run: bool,
+) -> FixTaskResult {
+    let ws_path = task_dir.join("workspace.yaml");
+    let dir_name = task_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let content = match fs::read_to_string(&ws_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return FixTaskResult {
+                task_id: dir_name,
+                repo: String::new(),
+                status: "skipped".to_string(),
+                original_install: String::new(),
+                fixed_install: None,
+                error: Some(format!("Failed to read: {}", e)),
+            };
+        }
+    };
+
+    let mut task: crate::swe::SweTask = match serde_yaml::from_str(&content) {
+        Ok(t) => t,
+        Err(e) => {
+            return FixTaskResult {
+                task_id: dir_name,
+                repo: String::new(),
+                status: "skipped".to_string(),
+                original_install: String::new(),
+                fixed_install: None,
+                error: Some(format!("Failed to parse YAML: {}", e)),
+            };
+        }
+    };
+
+    let original_install = task
+        .install_config
+        .get("install")
+        .cloned()
+        .unwrap_or_default();
+    info!(task_id = %task.id, repo = %task.repo, "Checking task...");
+
+    match validator.validate(&mut task).await {
+        Ok(crate::swe::ValidationOutcome::Passed) => {
+            let new_install = task
+                .install_config
+                .get("install")
+                .cloned()
+                .unwrap_or_default();
+            if new_install != original_install {
+                if !dry_run {
+                    if let Ok(yaml) = serde_yaml::to_string(&task) {
+                        let _ = fs::write(&ws_path, &yaml);
+                        info!(task_id = %task.id, "Fixed and saved");
+                    }
+                }
+                FixTaskResult {
+                    task_id: task.id,
+                    repo: task.repo,
+                    status: "fixed".to_string(),
+                    original_install,
+                    fixed_install: Some(new_install),
+                    error: None,
+                }
+            } else {
+                FixTaskResult {
+                    task_id: task.id,
+                    repo: task.repo,
+                    status: "ok".to_string(),
+                    original_install,
+                    fixed_install: None,
+                    error: None,
+                }
+            }
+        }
+        Ok(crate::swe::ValidationOutcome::Rejected { reason }) => FixTaskResult {
+            task_id: task.id,
+            repo: task.repo,
+            status: "failed".to_string(),
+            original_install,
+            fixed_install: None,
+            error: Some(reason),
+        },
+        Err(e) => FixTaskResult {
+            task_id: task.id,
+            repo: task.repo,
+            status: "failed".to_string(),
+            original_install,
+            fixed_install: None,
+            error: Some(format!("Validation error: {}", e)),
+        },
     }
 }
 
