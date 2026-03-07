@@ -1,0 +1,2 @@
+pytest -q tests/test_telegram_help_access.py
+pytest -q tests/test_commands.py

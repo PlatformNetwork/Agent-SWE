@@ -1,0 +1,3 @@
+pytest -q tests/test_removed_deprecated_features.py
+pytest -q tests/federation/test_utils.py
+pytest -q tests/tracing/test_opentelemetry.py

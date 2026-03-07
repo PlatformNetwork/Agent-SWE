@@ -1,0 +1,3 @@
+cd src && go test ./pkg/cli/client/byoc -run TestProjectUpdateIncludesEtag -count=1
+cd src && go test ./pkg/cli/client/byoc -run TestPublishMethodRemoved -count=1
+cd src && go test ./pkg/cli/client/byoc/aws -run TestDomainMultipleProjectSupport -count=1

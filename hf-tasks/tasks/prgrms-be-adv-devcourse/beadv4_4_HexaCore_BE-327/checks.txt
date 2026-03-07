@@ -1,0 +1,2 @@
+./gradlew :cash:test --tests com.back.cash.CashPaymentApiInterfaceExposureTest
+./gradlew :cash:test --tests com.back.cash.TossPaymentsClientTest

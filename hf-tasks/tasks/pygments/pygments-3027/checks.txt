@@ -1,0 +1,3 @@
+pytest tests/test_toml_1_1_lexer.py -q
+pytest tests/examplefiles/toml -q
+pytest tests/snippets/toml -q
