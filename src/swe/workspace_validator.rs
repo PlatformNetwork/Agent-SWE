@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use super::docker_sandbox::DockerSandbox;
+use super::docker_sandbox::{DockerSandbox, SandboxOutput};
 use super::sandbox_tools::{self, dispatch_tool, ToolOutput};
 use super::test_generator::TestFile;
 use super::SweTask;
@@ -114,13 +114,134 @@ IMPORTANT:
 - Install commands must be complete and self-contained for a fresh container.
 - Include `--break-system-packages` for pip commands on Python 3.12+.
 - Common missing tools: pytest, tox, nox, coverage, mypy, black, flake8, eslint, jest, mocha.
-- When a test fails with "No module named X", add `pip install --break-system-packages X` to install commands."#;
+- When a test fails with "No module named X", add `pip install --break-system-packages X` to install commands.
+
+CRITICAL DISTINCTION - "command not found" vs real test failure:
+- A fail_to_pass test that exits non-zero because "pytest: command not found" is BROKEN, not valid.
+- fail_to_pass tests must fail because test ASSERTIONS fail, not because the test runner is missing.
+- After fixing installs, RE-RUN all tests and verify the output contains actual test results.
+- Look for patterns like "FAILED", "AssertionError", "expected X got Y" in test output to confirm real failures.
+- If you see "command not found" or "No module named" in any test output, the install is incomplete."#;
 
 /// Result of workspace validation.
 #[derive(Debug, Clone)]
 pub enum ValidationOutcome {
     Passed,
     Rejected { reason: String },
+}
+
+/// Result of running tests -- distinguishes real test failures from broken environments.
+#[derive(Debug, Clone)]
+enum TestRunResult {
+    /// All tests behaved as expected.
+    Ok,
+    /// A test failed for a real logic/assertion reason.
+    RealFailure { cmd: String, detail: String },
+    /// A test failed because the environment is broken (missing tool, module, etc.).
+    EnvironmentBroken { cmd: String, diagnosis: String },
+}
+
+/// Use LLM to classify whether a test failure is a genuine assertion failure
+/// or a broken environment (missing tool, missing module, etc.).
+/// Returns `true` if the failure is an environment issue (broken), `false` if real test failure.
+async fn llm_diagnose_failure(
+    llm: &Arc<dyn LlmProvider>,
+    task_id: &str,
+    cmd: &str,
+    output: &SandboxOutput,
+) -> bool {
+    let diagnose_tool = ToolDefinition::function(
+        "classify_failure",
+        "Classify whether this test failure is a real test assertion failure or a broken environment issue.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "is_environment_issue": {
+                    "type": "boolean",
+                    "description": "true if the failure is caused by missing tools, missing modules, broken PATH, or incomplete installation. false if the test ran properly but assertions/checks failed."
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation of your classification."
+                }
+            },
+            "required": ["is_environment_issue", "reasoning"]
+        }),
+    );
+
+    let stdout_trunc: String = output.stdout.chars().take(2000).collect();
+    let stderr_trunc: String = output.stderr.chars().take(1000).collect();
+
+    let user_msg = format!(
+        "A test command failed. Classify whether this is a real test failure or a broken environment.\n\n\
+         Command: {cmd}\n\
+         Exit code: {exit}\n\n\
+         stdout (truncated):\n```\n{stdout}\n```\n\n\
+         stderr (truncated):\n```\n{stderr}\n```\n\n\
+         IMPORTANT: A \"real test failure\" means the test runner executed properly and test assertions/checks \
+         failed (e.g. pytest ran and reported FAILED tests, jest ran and reported failing expects, etc.).\n\
+         An \"environment issue\" means the test could not even run properly -- missing command, missing module, \
+         import error, command not found, permission denied on a tool binary, etc.\n\n\
+         Call classify_failure with your verdict.",
+        cmd = cmd,
+        exit = output.exit_code,
+        stdout = stdout_trunc,
+        stderr = stderr_trunc,
+    );
+
+    let request = GenerationRequest {
+        model: install_model(),
+        messages: vec![
+            Message::system(
+                "You are a test output classifier. Analyze the test output and determine whether \
+                 the failure is a real test assertion failure or a broken environment issue. \
+                 You MUST call the classify_failure tool with your verdict."
+                    .to_string(),
+            ),
+            Message::user(user_msg),
+        ],
+        temperature: Some(0.0),
+        max_tokens: Some(500),
+        top_p: None,
+        response_format: None,
+        tools: Some(vec![diagnose_tool]),
+        tool_choice: Some(ToolChoice::force("classify_failure")),
+    };
+
+    match llm.generate(request).await {
+        Ok(response) => {
+            if let Some(choice) = response.choices.first() {
+                if let Some(ref tool_calls) = choice.message.tool_calls {
+                    if let Some(tc) = tool_calls.first() {
+                        #[derive(serde::Deserialize)]
+                        struct ClassifyResult {
+                            is_environment_issue: bool,
+                            #[serde(default)]
+                            reasoning: String,
+                        }
+                        if let Ok(result) =
+                            serde_json::from_str::<ClassifyResult>(&tc.function.arguments)
+                        {
+                            tracing::info!(
+                                task_id = task_id,
+                                cmd = cmd,
+                                is_env = result.is_environment_issue,
+                                reasoning = %result.reasoning,
+                                "LLM diagnosed test failure"
+                            );
+                            return result.is_environment_issue;
+                        }
+                    }
+                }
+            }
+            tracing::warn!(task_id = task_id, cmd = cmd, "LLM diagnosis returned no usable result, assuming real failure");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(task_id = task_id, cmd = cmd, error = %e, "LLM diagnosis failed, assuming real failure");
+            false
+        }
+    }
 }
 
 // ── Verification tool definitions ─────────────────────────────────────────
@@ -698,15 +819,27 @@ impl WorkspaceValidator {
                 }
             }
 
-            let base_tests_ok = self.run_base_tests(&base_sandbox, task).await;
+            let base_result = self.run_base_tests(&base_sandbox, task).await;
             base_sandbox.destroy().await;
 
-            if !base_tests_ok {
-                tracing::warn!(
-                    task_id = %task.id, cycle = cycle + 1,
-                    "Blind replay base tests failed after verify agent, retrying"
-                );
-                continue;
+            match base_result {
+                TestRunResult::Ok => {}
+                TestRunResult::EnvironmentBroken { ref cmd, ref diagnosis } => {
+                    tracing::warn!(
+                        task_id = %task.id, cycle = cycle + 1,
+                        cmd = %cmd, diagnosis = %diagnosis,
+                        "Base tests: LLM detected broken environment, retrying with verify agent"
+                    );
+                    continue;
+                }
+                TestRunResult::RealFailure { ref cmd, ref detail } => {
+                    tracing::warn!(
+                        task_id = %task.id, cycle = cycle + 1,
+                        cmd = %cmd, detail = %detail,
+                        "Base tests: real test failure, retrying"
+                    );
+                    continue;
+                }
             }
 
             // ── Step 2b: Patched-commit tests in another fresh container ──
@@ -748,21 +881,32 @@ impl WorkspaceValidator {
                 }
             }
 
-            let patched_tests_ok = self.run_patched_tests(&patched_sandbox, task).await;
+            let patched_result = self.run_patched_tests(&patched_sandbox, task).await;
             patched_sandbox.destroy().await;
 
-            if base_tests_ok && patched_tests_ok {
-                tracing::info!(
-                    task_id = %task.id, cycle = cycle + 1,
-                    "Workspace validation PASSED (fresh replay confirmed with isolated containers)"
-                );
-                return Ok(ValidationOutcome::Passed);
+            match patched_result {
+                TestRunResult::Ok => {
+                    tracing::info!(
+                        task_id = %task.id, cycle = cycle + 1,
+                        "Workspace validation PASSED (fresh replay confirmed with isolated containers)"
+                    );
+                    return Ok(ValidationOutcome::Passed);
+                }
+                TestRunResult::EnvironmentBroken { ref cmd, ref diagnosis } => {
+                    tracing::warn!(
+                        task_id = %task.id, cycle = cycle + 1,
+                        cmd = %cmd, diagnosis = %diagnosis,
+                        "Patched tests: LLM detected broken environment, retrying with verify agent"
+                    );
+                }
+                TestRunResult::RealFailure { ref cmd, ref detail } => {
+                    tracing::warn!(
+                        task_id = %task.id, cycle = cycle + 1,
+                        cmd = %cmd, detail = %detail,
+                        "Patched tests: real test failure, retrying"
+                    );
+                }
             }
-
-            tracing::warn!(
-                task_id = %task.id, cycle = cycle + 1,
-                "Blind replay patched tests failed after verify agent, retrying"
-            );
         }
 
         Ok(ValidationOutcome::Rejected {
@@ -1044,9 +1188,8 @@ impl WorkspaceValidator {
     }
 
     /// Run base-commit tests in an isolated container: f2p must FAIL, p2p must PASS.
-    /// No patch is applied — this validates that the test expectations hold on the
-    /// unmodified base commit.
-    async fn run_base_tests(&self, sandbox: &DockerSandbox, task: &SweTask) -> bool {
+    /// Uses LLM to classify ambiguous failures as real vs environment issues.
+    async fn run_base_tests(&self, sandbox: &DockerSandbox, task: &SweTask) -> TestRunResult {
         // Base commit: f2p must FAIL
         for cmd in &task.fail_to_pass {
             let r = sandbox.exec(&format!("cd /repo && {}", cmd), 120_000).await;
@@ -1056,7 +1199,24 @@ impl WorkspaceValidator {
                     cmd = %cmd,
                     "Fresh replay (base): f2p already passes on base"
                 );
-                return false;
+                return TestRunResult::RealFailure {
+                    cmd: cmd.clone(),
+                    detail: "f2p already passes on base commit".to_string(),
+                };
+            }
+            // f2p failed (good) -- but ask LLM if this is a real test failure or broken env
+            if let Some(ref llm) = self.llm {
+                if llm_diagnose_failure(llm, &task.id, cmd, &r).await {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        cmd = %cmd,
+                        "Fresh replay (base): LLM says f2p fails due to broken environment"
+                    );
+                    return TestRunResult::EnvironmentBroken {
+                        cmd: cmd.clone(),
+                        diagnosis: "f2p fails due to broken environment, not test logic".to_string(),
+                    };
+                }
             }
             tracing::info!(
                 task_id = %task.id,
@@ -1069,13 +1229,30 @@ impl WorkspaceValidator {
         for cmd in &task.pass_to_pass {
             let r = sandbox.exec(&format!("cd /repo && {}", cmd), 120_000).await;
             if r.exit_code != 0 {
+                // p2p should pass -- ask LLM to classify the failure
+                if let Some(ref llm) = self.llm {
+                    if llm_diagnose_failure(llm, &task.id, cmd, &r).await {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            cmd = %cmd,
+                            "Fresh replay (base): LLM says p2p fails due to broken environment"
+                        );
+                        return TestRunResult::EnvironmentBroken {
+                            cmd: cmd.clone(),
+                            diagnosis: "p2p fails due to broken environment".to_string(),
+                        };
+                    }
+                }
                 tracing::warn!(
                     task_id = %task.id,
                     cmd = %cmd,
                     exit = r.exit_code,
                     "Fresh replay (base): p2p fails on base"
                 );
-                return false;
+                return TestRunResult::RealFailure {
+                    cmd: cmd.clone(),
+                    detail: format!("p2p fails on base (exit {})", r.exit_code),
+                };
             }
             tracing::info!(
                 task_id = %task.id,
@@ -1084,19 +1261,22 @@ impl WorkspaceValidator {
             );
         }
 
-        true
+        TestRunResult::Ok
     }
 
     /// Apply the patch and run tests in an isolated container: f2p must PASS, p2p must PASS.
-    /// This validates that the patch fixes the failing tests without breaking passing ones.
-    async fn run_patched_tests(&self, sandbox: &DockerSandbox, task: &SweTask) -> bool {
+    /// Uses LLM to classify ambiguous failures as real vs environment issues.
+    async fn run_patched_tests(&self, sandbox: &DockerSandbox, task: &SweTask) -> TestRunResult {
         // Apply patch
         if let Err(e) = sandbox
             .write_file(".swe_forge_validation.patch", &task.patch)
             .await
         {
             tracing::warn!(task_id = %task.id, error = %e, "Fresh replay (patched): failed to write patch");
-            return false;
+            return TestRunResult::RealFailure {
+                cmd: "(patch apply)".to_string(),
+                detail: format!("failed to write patch: {e}"),
+            };
         }
 
         let apply = sandbox
@@ -1114,7 +1294,10 @@ impl WorkspaceValidator {
                 .await;
             if apply_3way.exit_code != 0 {
                 tracing::warn!(task_id = %task.id, "Fresh replay (patched): patch apply failed");
-                return false;
+                return TestRunResult::RealFailure {
+                    cmd: "(patch apply)".to_string(),
+                    detail: "patch apply failed".to_string(),
+                };
             }
         }
 
@@ -1131,13 +1314,29 @@ impl WorkspaceValidator {
         for cmd in &task.fail_to_pass {
             let r = sandbox.exec(&format!("cd /repo && {}", cmd), 120_000).await;
             if r.exit_code != 0 {
+                if let Some(ref llm) = self.llm {
+                    if llm_diagnose_failure(llm, &task.id, cmd, &r).await {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            cmd = %cmd,
+                            "Fresh replay (patched): LLM says f2p fails due to broken environment"
+                        );
+                        return TestRunResult::EnvironmentBroken {
+                            cmd: cmd.clone(),
+                            diagnosis: "f2p fails due to broken environment after patch".to_string(),
+                        };
+                    }
+                }
                 tracing::warn!(
                     task_id = %task.id,
                     cmd = %cmd,
                     exit = r.exit_code,
                     "Fresh replay (patched): f2p still fails after patch"
                 );
-                return false;
+                return TestRunResult::RealFailure {
+                    cmd: cmd.clone(),
+                    detail: format!("f2p still fails after patch (exit {})", r.exit_code),
+                };
             }
             tracing::info!(
                 task_id = %task.id,
@@ -1150,13 +1349,29 @@ impl WorkspaceValidator {
         for cmd in &task.pass_to_pass {
             let r = sandbox.exec(&format!("cd /repo && {}", cmd), 120_000).await;
             if r.exit_code != 0 {
+                if let Some(ref llm) = self.llm {
+                    if llm_diagnose_failure(llm, &task.id, cmd, &r).await {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            cmd = %cmd,
+                            "Fresh replay (patched): LLM says p2p fails due to broken environment"
+                        );
+                        return TestRunResult::EnvironmentBroken {
+                            cmd: cmd.clone(),
+                            diagnosis: "p2p fails due to broken environment after patch".to_string(),
+                        };
+                    }
+                }
                 tracing::warn!(
                     task_id = %task.id,
                     cmd = %cmd,
                     exit = r.exit_code,
                     "Fresh replay (patched): p2p fails after patch"
                 );
-                return false;
+                return TestRunResult::RealFailure {
+                    cmd: cmd.clone(),
+                    detail: format!("p2p fails after patch (exit {})", r.exit_code),
+                };
             }
             tracing::info!(
                 task_id = %task.id,
@@ -1165,7 +1380,7 @@ impl WorkspaceValidator {
             );
         }
 
-        true
+        TestRunResult::Ok
     }
 }
 
