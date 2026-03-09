@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use super::docker_sandbox::{DockerSandbox, SandboxOutput};
+use super::rechecker::{RecheckResult, Rechecker, RecheckerConfig};
 use super::sandbox_tools::{self, dispatch_tool, ToolOutput};
 use super::test_generator::TestFile;
 use super::SweTask;
@@ -301,6 +302,7 @@ fn submit_verified_install_tool() -> ToolDefinition {
 pub struct WorkspaceValidator {
     image_override: Option<String>,
     llm: Option<Arc<dyn LlmProvider>>,
+    rechecker: Rechecker,
 }
 
 impl WorkspaceValidator {
@@ -308,6 +310,20 @@ impl WorkspaceValidator {
         Self {
             image_override,
             llm,
+            rechecker: Rechecker::new(RecheckerConfig::default()),
+        }
+    }
+
+    /// Create a validator with a custom rechecker configuration.
+    pub fn with_rechecker_config(
+        image_override: Option<String>,
+        llm: Option<Arc<dyn LlmProvider>>,
+        rechecker_config: RecheckerConfig,
+    ) -> Self {
+        Self {
+            image_override,
+            llm,
+            rechecker: Rechecker::new(rechecker_config),
         }
     }
 
@@ -808,10 +824,55 @@ impl WorkspaceValidator {
             if !base_install_ok {
                 tracing::warn!(
                     task_id = %task.id, cycle = cycle + 1,
-                    "Blind replay install failed (base container) after verify agent, retrying"
+                    "Blind replay install failed (base container), attempting rechecker fix"
                 );
-                base_sandbox.destroy().await;
-                continue;
+
+                // Try to fix install using rechecker
+                match self.rechecker.fix_install(task) {
+                    Ok(RecheckResult::Fixed) => {
+                        tracing::info!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Rechecker fixed install commands, retrying with: {:?}",
+                            task.install_config.get("install")
+                        );
+                        base_sandbox.destroy().await;
+                        continue;
+                    }
+                    Ok(RecheckResult::Incorrigible) => {
+                        tracing::warn!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Rechecker could not fix install commands, task is incorrigible"
+                        );
+                        base_sandbox.destroy().await;
+                        return Ok(ValidationOutcome::Rejected {
+                            reason: format!(
+                                "Fresh replay cycle {}: install failed and rechecker could not fix after max attempts",
+                                cycle + 1
+                            ),
+                        });
+                    }
+                    Ok(result) => {
+                        tracing::warn!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Rechecker returned {:?}, retrying cycle", result
+                        );
+                        base_sandbox.destroy().await;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = %task.id, cycle = cycle + 1, error = %e,
+                            "Rechecker error during install fix"
+                        );
+                        base_sandbox.destroy().await;
+                        return Ok(ValidationOutcome::Rejected {
+                            reason: format!(
+                                "Fresh replay cycle {}: rechecker error: {}",
+                                cycle + 1, e
+                            ),
+                        });
+                    }
+                }
             }
 
             // Copy test files into base container
@@ -876,10 +937,55 @@ impl WorkspaceValidator {
             if !patched_install_ok {
                 tracing::warn!(
                     task_id = %task.id, cycle = cycle + 1,
-                    "Blind replay install failed (patched container) after verify agent, retrying"
+                    "Blind replay install failed (patched container), attempting rechecker fix"
                 );
-                patched_sandbox.destroy().await;
-                continue;
+
+                // Try to fix install using rechecker
+                match self.rechecker.fix_install(task) {
+                    Ok(RecheckResult::Fixed) => {
+                        tracing::info!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Rechecker fixed install commands, retrying with: {:?}",
+                            task.install_config.get("install")
+                        );
+                        patched_sandbox.destroy().await;
+                        continue;
+                    }
+                    Ok(RecheckResult::Incorrigible) => {
+                        tracing::warn!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Rechecker could not fix install commands, task is incorrigible"
+                        );
+                        patched_sandbox.destroy().await;
+                        return Ok(ValidationOutcome::Rejected {
+                            reason: format!(
+                                "Fresh replay cycle {}: install failed and rechecker could not fix after max attempts",
+                                cycle + 1
+                            ),
+                        });
+                    }
+                    Ok(result) => {
+                        tracing::warn!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Rechecker returned {:?}, retrying cycle", result
+                        );
+                        patched_sandbox.destroy().await;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = %task.id, cycle = cycle + 1, error = %e,
+                            "Rechecker error during install fix"
+                        );
+                        patched_sandbox.destroy().await;
+                        return Ok(ValidationOutcome::Rejected {
+                            reason: format!(
+                                "Fresh replay cycle {}: rechecker error: {}",
+                                cycle + 1, e
+                            ),
+                        });
+                    }
+                }
             }
 
             // Copy test files into patched container
@@ -1459,6 +1565,7 @@ fn truncate_str(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::swe::{ErrorType, SweTaskStatus};
 
     #[test]
     fn prompt_feasibility_empty() {
@@ -1550,5 +1657,98 @@ mod tests {
         // When env var is not set, should return default
         let model = install_model();
         assert!(!model.is_empty());
+    }
+
+    // ── Rechecker integration tests ─────────────────────────────────────────
+
+    #[test]
+    fn validator_with_rechecker_config() {
+        let config = RecheckerConfig::with_max_attempts(5);
+        let v = WorkspaceValidator::with_rechecker_config(None, None, config);
+        assert!(v.llm.is_none());
+        assert!(v.image_override.is_none());
+    }
+
+    #[test]
+    fn rechecker_fixes_broken_python_install() {
+        let rechecker = Rechecker::default();
+        let mut task = SweTask::new("test-1", "owner/repo");
+        task.language = "python".to_string();
+        task.install_config.insert("install".to_string(), "# broken install".to_string());
+
+        let result = rechecker.fix_install(&mut task).unwrap();
+        assert_eq!(result, RecheckResult::Fixed);
+        
+        // Install command should be updated to a valid pip command
+        let install_cmd = task.install_config.get("install").unwrap();
+        assert!(install_cmd.contains("pip install"));
+    }
+
+    #[test]
+    fn rechecker_keeps_valid_install() {
+        let rechecker = Rechecker::default();
+        let mut task = SweTask::new("test-2", "owner/repo");
+        task.language = "python".to_string();
+        task.install_config.insert("install".to_string(), "pip install -e .".to_string());
+
+        let result = rechecker.fix_install(&mut task).unwrap();
+        assert_eq!(result, RecheckResult::Ok);
+        
+        // Install command should remain unchanged
+        let install_cmd = task.install_config.get("install").unwrap();
+        assert_eq!(install_cmd, "pip install -e .");
+    }
+
+    #[test]
+    fn rechecker_generates_node_strategies() {
+        let rechecker = Rechecker::default();
+        let mut task = SweTask::new("test-3", "owner/repo");
+        task.language = "javascript".to_string();
+        task.install_config.insert("install".to_string(), "# broken".to_string());
+
+        let result = rechecker.fix_install(&mut task).unwrap();
+        assert_eq!(result, RecheckResult::Fixed);
+        
+        let install_cmd = task.install_config.get("install").unwrap();
+        assert!(install_cmd.contains("npm") || install_cmd.contains("yarn") || install_cmd.contains("pnpm"));
+    }
+
+    #[test]
+    fn rechecker_detects_setup_error() {
+        let rechecker = Rechecker::default();
+        let task = SweTask::new("test-4", "owner/repo");
+
+        let error_type = rechecker.detect_error_type(&task, Some("pip install failed with exit code 1"));
+        assert_eq!(error_type, ErrorType::SetupError);
+    }
+
+    #[test]
+    fn rechecker_detects_sanity_fail() {
+        let rechecker = Rechecker::default();
+        let task = SweTask::new("test-5", "owner/repo");
+
+        let error_type = rechecker.detect_error_type(&task, Some("fail_to_pass already passes on base commit"));
+        assert_eq!(error_type, ErrorType::SanityFail);
+    }
+
+    #[test]
+    fn rechecker_fix_task_with_setup_error() {
+        let rechecker = Rechecker::default();
+        let mut task = SweTask::new("test-6", "owner/repo");
+        task.language = "python".to_string();
+        task.status = SweTaskStatus::Rejected;
+        task.install_config.insert("install".to_string(), "# invalid".to_string());
+
+        let result = rechecker.fix_task(&mut task, Some("Install failed")).unwrap();
+        assert!(matches!(result, RecheckResult::Fixed | RecheckResult::Ok));
+    }
+
+    #[test]
+    fn rechecker_should_remove_incorrigible() {
+        let rechecker = Rechecker::default();
+        assert!(rechecker.should_remove(&RecheckResult::Incorrigible));
+        assert!(!rechecker.should_remove(&RecheckResult::Fixed));
+        assert!(!rechecker.should_remove(&RecheckResult::Ok));
+        assert!(!rechecker.should_remove(&RecheckResult::Skipped));
     }
 }
