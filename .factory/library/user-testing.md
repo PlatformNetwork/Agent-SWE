@@ -144,5 +144,41 @@ Expected flow:
 
 - Docker operations can be slow (use longer timeouts)
 - --network=host means containers share host network namespace
-- Container names must be unique (timestamp suffix used)
+- Container names must be unique (UUID suffix used)
 - Git checkout --force to handle any local changes
+
+## Flow Validator Guidance: CLI Testing
+
+### Isolation Strategy
+CLI tests use cargo test which is inherently isolated per test process. Each test:
+- Creates its own temporary directories
+- Uses unique container names (UUID-based)
+- Runs in separate threads/processes
+- Cleans up containers on Drop
+
+No special isolation needed between parallel flow validators.
+
+### Testing Tools
+- Use direct command execution (cargo test) for assertion testing
+- Use docker ps and docker inspect for verification
+- Tests should run with --nocapture for full output
+
+### Expected Evidence
+For Docker assertions:
+- VAL-DOCKER-001: Test passes that creates container + docker ps shows it existed
+- VAL-DOCKER-002: Test passes that destroys container + docker ps -a shows no lingering containers
+- VAL-DOCKER-003: Test passes with command execution + correct exit code captured
+- VAL-DOCKER-004: Test passes with file write/read + content matches
+- VAL-DOCKER-005: Test passes + docker inspect shows correct limits
+
+### Verification Commands
+```bash
+# Check for lingering containers before testing
+docker ps -a | grep swe- || echo "Clean"
+
+# Run specific test
+cargo test --lib <test_name> -- --nocapture
+
+# Verify cleanup after testing  
+docker ps -a | grep swe- || echo "Clean"
+```

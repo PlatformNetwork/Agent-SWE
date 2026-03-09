@@ -1,0 +1,69 @@
+{
+  "milestone": "infrastructure-testing",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 5,
+    "passed": 5,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-DOCKER-001",
+    "VAL-DOCKER-002",
+    "VAL-DOCKER-003",
+    "VAL-DOCKER-004",
+    "VAL-DOCKER-005"
+  ],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Added Flow Validator Guidance: CLI Testing section documenting isolation strategy, testing tools, expected evidence, and verification commands for Docker assertions",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null,
+  "synthesisDetails": {
+    "flowReports": [
+      ".factory/validation/infrastructure-testing/user-testing/flows/docker-lifecycle.json",
+      ".factory/validation/infrastructure-testing/user-testing/flows/docker-commands-files.json",
+      ".factory/validation/infrastructure-testing/user-testing/flows/docker-resources.json"
+    ],
+    "testSummary": {
+      "docker-lifecycle": {
+        "assertions": ["VAL-DOCKER-001", "VAL-DOCKER-002"],
+        "testsRun": 21,
+        "testsPassed": 21,
+        "toolsUsed": ["cargo test", "docker ps", "docker rm"]
+      },
+      "docker-commands-files": {
+        "assertions": ["VAL-DOCKER-003", "VAL-DOCKER-004"],
+        "testsRun": 7,
+        "testsPassed": 7,
+        "toolsUsed": ["cargo test"]
+      },
+      "docker-resources": {
+        "assertions": ["VAL-DOCKER-005"],
+        "testsRun": 42,
+        "testsPassed": 42,
+        "toolsUsed": ["cargo test", "docker inspect"]
+      }
+    },
+    "totalTestsPassed": 70,
+    "frictionsNoted": [
+      {
+        "description": "Initial environment had 37 lingering containers from previous test runs. Tests use unique UUID-based container names and clean up properly, but leftover containers from other processes can make pre-test state verification noisy.",
+        "resolution": "Tests use unique container names with UUID suffixes to avoid collisions; cleanup verification focuses on containers created during test execution"
+      }
+    ],
+    "evidenceHighlights": {
+      "VAL-DOCKER-001": "test_container_creation_and_destruction passed - container_exists() returns true after DockerSandbox::start()",
+      "VAL-DOCKER-002": "test_cleanup_on_drop passed - Drop trait cleanup verified; explicit destroy() removes containers; container count reduced appropriately",
+      "VAL-DOCKER-003": "3 tests passed - exit codes verified (0 for success, 42 for explicit failure, -1 for timeout), stdout/stderr captured correctly",
+      "VAL-DOCKER-004": "4 tests passed - file write/read verified with content matching, subdirectory creation works, nonexistent file error handling correct",
+      "VAL-DOCKER-005": "42 tests passed - memory (32GB), PIDs (100/200/500), storage (1GB/2GB/5GB), and network modes (none/bridge) verified via docker inspect"
+    }
+  }
+}
