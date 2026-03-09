@@ -63,9 +63,9 @@ validated-dataset/
 benchmark-output/
 
 # Mission artifacts (private)
-.factory/missions/
+.factory/
 handoffs/
 
 # Mission artifacts (private)
-.factory/missions/
+.factory/
 handoffs/
