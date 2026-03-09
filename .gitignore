@@ -61,3 +61,11 @@ agent-tests/
 test-run/
 validated-dataset/
 benchmark-output/
+
+# Mission artifacts (private)
+.factory/missions/
+handoffs/
+
+# Mission artifacts (private)
+.factory/missions/
+handoffs/
