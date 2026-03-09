@@ -847,7 +847,11 @@ mod tests {
 
     /// Helper: Check if Docker is available
     async fn docker_available() -> bool {
-        match tokio::process::Command::new("docker").args(["ps"]).output().await {
+        match tokio::process::Command::new("docker")
+            .args(["ps"])
+            .output()
+            .await
+        {
             Ok(output) => output.status.success(),
             Err(_) => false,
         }
@@ -897,8 +901,8 @@ mod tests {
         let task = create_mock_task(
             "test-semantics-f2p-fails-base",
             vec!["python3 -c 'import sys; sys.exit(1)'".to_string()], // Always fails
-            vec![],                                                  // No p2p tests
-            "",                                                      // No patch
+            vec![],                                                   // No p2p tests
+            "",                                                       // No patch
         );
 
         // Start sandbox at base commit
@@ -914,7 +918,10 @@ mod tests {
         // Run fail_to_pass command - should fail (exit != 0)
         let results = run_test_commands(&sandbox, &task.fail_to_pass).await;
         assert_eq!(results.len(), 1);
-        assert_ne!(results[0].0, 0, "fail_to_pass command should fail on base commit");
+        assert_ne!(
+            results[0].0, 0,
+            "fail_to_pass command should fail on base commit"
+        );
 
         sandbox.destroy().await;
     }
@@ -932,9 +939,9 @@ mod tests {
         // Create a task with pass_to_pass command that should pass on base
         let task = create_mock_task(
             "test-semantics-p2p-passes-base",
-            vec![],                                               // No f2p tests
+            vec![],                                                   // No f2p tests
             vec!["python3 -c 'import sys; sys.exit(0)'".to_string()], // Always passes
-            "",                                                   // No patch
+            "",                                                       // No patch
         );
 
         // Start sandbox at base commit
@@ -950,7 +957,10 @@ mod tests {
         // Run pass_to_pass command - should pass (exit == 0)
         let results = run_test_commands(&sandbox, &task.pass_to_pass).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, 0, "pass_to_pass command should pass on base commit");
+        assert_eq!(
+            results[0].0, 0,
+            "pass_to_pass command should pass on base commit"
+        );
 
         sandbox.destroy().await;
     }
@@ -995,18 +1005,34 @@ index 0000000..e69de29
 
         // Verify fail_to_pass FAILS on base (before patch)
         let base_results = run_test_commands(&sandbox, &task.fail_to_pass).await;
-        assert_ne!(base_results[0].0, 0, "fail_to_pass should fail on base before patch");
+        assert_ne!(
+            base_results[0].0, 0,
+            "fail_to_pass should fail on base before patch"
+        );
 
         // Apply the patch
-        sandbox.write_file(".swe_forge_validation.patch", &task.patch).await.unwrap();
+        sandbox
+            .write_file(".swe_forge_validation.patch", &task.patch)
+            .await
+            .unwrap();
         let apply_result = sandbox
-            .exec("cd /repo && git apply --allow-empty .swe_forge_validation.patch 2>&1", 30_000)
+            .exec(
+                "cd /repo && git apply --allow-empty .swe_forge_validation.patch 2>&1",
+                30_000,
+            )
             .await;
-        assert_eq!(apply_result.exit_code, 0, "Patch should apply successfully: {}", apply_result.stderr);
+        assert_eq!(
+            apply_result.exit_code, 0,
+            "Patch should apply successfully: {}",
+            apply_result.stderr
+        );
 
         // Verify fail_to_pass PASSES after patch
         let patched_results = run_test_commands(&sandbox, &task.fail_to_pass).await;
-        assert_eq!(patched_results[0].0, 0, "fail_to_pass should pass after valid patch");
+        assert_eq!(
+            patched_results[0].0, 0,
+            "fail_to_pass should pass after valid patch"
+        );
 
         sandbox.destroy().await;
     }
@@ -1035,7 +1061,10 @@ index 0000000..e69de29
         let task = create_mock_task(
             "test-semantics-p2p-still-passes",
             vec![],
-            vec!["python3 -c 'import os; os.listdir(\".\"); print(\"Basic functionality works\")'".to_string()],
+            vec![
+                "python3 -c 'import os; os.listdir(\".\"); print(\"Basic functionality works\")'"
+                    .to_string(),
+            ],
             patch,
         );
 
@@ -1054,15 +1083,24 @@ index 0000000..e69de29
         assert_eq!(base_results[0].0, 0, "pass_to_pass should pass on base");
 
         // Apply the patch
-        sandbox.write_file(".swe_forge_validation.patch", &task.patch).await.unwrap();
+        sandbox
+            .write_file(".swe_forge_validation.patch", &task.patch)
+            .await
+            .unwrap();
         let apply_result = sandbox
-            .exec("cd /repo && git apply --allow-empty .swe_forge_validation.patch 2>&1", 30_000)
+            .exec(
+                "cd /repo && git apply --allow-empty .swe_forge_validation.patch 2>&1",
+                30_000,
+            )
             .await;
         assert_eq!(apply_result.exit_code, 0, "Patch should apply successfully");
 
         // Verify pass_to_pass STILL PASSES after patch (no regression)
         let patched_results = run_test_commands(&sandbox, &task.pass_to_pass).await;
-        assert_eq!(patched_results[0].0, 0, "pass_to_pass should still pass after patch (no regression)");
+        assert_eq!(
+            patched_results[0].0, 0,
+            "pass_to_pass should still pass after patch (no regression)"
+        );
 
         sandbox.destroy().await;
     }
@@ -1111,15 +1149,28 @@ index 0000000..e69de29
         assert_ne!(base_results[0].0, 0, "fail_to_pass should fail on base");
 
         // Apply the invalid patch
-        sandbox.write_file(".swe_forge_validation.patch", &task.patch).await.unwrap();
+        sandbox
+            .write_file(".swe_forge_validation.patch", &task.patch)
+            .await
+            .unwrap();
         let apply_result = sandbox
-            .exec("cd /repo && git apply .swe_forge_validation.patch 2>&1", 30_000)
+            .exec(
+                "cd /repo && git apply .swe_forge_validation.patch 2>&1",
+                30_000,
+            )
             .await;
-        assert_eq!(apply_result.exit_code, 0, "Patch should apply successfully: {}", apply_result.stderr);
+        assert_eq!(
+            apply_result.exit_code, 0,
+            "Patch should apply successfully: {}",
+            apply_result.stderr
+        );
 
         // Verify fail_to_pass STILL FAILS after invalid patch (wrong_fix.py != required_fix.py)
         let patched_results = run_test_commands(&sandbox, &task.fail_to_pass).await;
-        assert_ne!(patched_results[0].0, 0, "fail_to_pass should still fail after invalid patch");
+        assert_ne!(
+            patched_results[0].0, 0,
+            "fail_to_pass should still fail after invalid patch"
+        );
 
         sandbox.destroy().await;
     }
@@ -1186,9 +1237,15 @@ index 0000000..e69de29
         );
 
         // --- APPLY PATCH ---
-        sandbox.write_file(".swe_forge_validation.patch", &task.patch).await.unwrap();
+        sandbox
+            .write_file(".swe_forge_validation.patch", &task.patch)
+            .await
+            .unwrap();
         let apply_result = sandbox
-            .exec("cd /repo && git apply --allow-empty .swe_forge_validation.patch 2>&1", 30_000)
+            .exec(
+                "cd /repo && git apply --allow-empty .swe_forge_validation.patch 2>&1",
+                30_000,
+            )
             .await;
         assert_eq!(apply_result.exit_code, 0, "Patch should apply successfully");
 
@@ -1247,8 +1304,13 @@ index 0000000..e69de29
         .expect("Failed to start sandbox");
 
         // Verify fail_to_pass passes on base (this would trigger SanityFail in harness)
-        let result = sandbox.exec(&format!("cd /repo && {}", &task.fail_to_pass[0]), 30_000).await;
-        assert_eq!(result.exit_code, 0, "fail_to_pass command passes on base (would trigger SanityFail in harness)");
+        let result = sandbox
+            .exec(&format!("cd /repo && {}", &task.fail_to_pass[0]), 30_000)
+            .await;
+        assert_eq!(
+            result.exit_code, 0,
+            "fail_to_pass command passes on base (would trigger SanityFail in harness)"
+        );
 
         sandbox.destroy().await;
     }
@@ -1281,8 +1343,13 @@ index 0000000..e69de29
         .expect("Failed to start sandbox");
 
         // Verify pass_to_pass fails on base (this would trigger SanityFail in harness)
-        let result = sandbox.exec(&format!("cd /repo && {}", &task.pass_to_pass[0]), 30_000).await;
-        assert_ne!(result.exit_code, 0, "pass_to_pass command fails on base (would trigger SanityFail in harness)");
+        let result = sandbox
+            .exec(&format!("cd /repo && {}", &task.pass_to_pass[0]), 30_000)
+            .await;
+        assert_ne!(
+            result.exit_code, 0,
+            "pass_to_pass command fails on base (would trigger SanityFail in harness)"
+        );
 
         sandbox.destroy().await;
     }
