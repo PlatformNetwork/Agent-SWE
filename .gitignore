@@ -66,6 +66,6 @@ benchmark-output/
 .factory/
 handoffs/
 
-# Mission artifacts (private)
-.factory/
-handoffs/
+# Task data (large, uploaded separately to HuggingFace)
+hf-tasks/
+*.log

@@ -851,6 +851,13 @@ impl WorkspaceValidator {
                             ),
                         });
                     }
+                    Ok(RecheckResult::Ok) => {
+                        tracing::info!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Rechecker confirmed install commands are valid"
+                        );
+                        // Continue with current commands
+                    }
                     Ok(result) => {
                         tracing::warn!(
                             task_id = %task.id, cycle = cycle + 1,
@@ -963,6 +970,13 @@ impl WorkspaceValidator {
                                 cycle + 1
                             ),
                         });
+                    }
+                    Ok(RecheckResult::Ok) => {
+                        tracing::info!(
+                            task_id = %task.id, cycle = cycle + 1,
+                            "Rechecker confirmed install commands are valid"
+                        );
+                        // Continue with current commands
                     }
                     Ok(result) => {
                         tracing::warn!(
