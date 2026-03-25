@@ -1,0 +1,124 @@
+"""SWE task models for DataForge-compatible task format."""
+
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Annotated
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class SweTaskStatus(str, Enum):
+    """Status of a SWE mined task."""
+
+    CANDIDATE = "candidate"
+    REJECTED = "rejected"
+    READY = "ready"
+    EXPORTED = "exported"
+    VALIDATED = "validated"
+
+
+class ValidationOutcome(BaseModel):
+    """Result of workspace validation."""
+
+    passed: bool
+    reason: str | None = None
+
+
+def validate_git_ref(s: str) -> str:
+    """Validate a git ref (commit SHA, branch name) to prevent shell injection.
+
+    Accepts hex-only SHAs (short or full) and standard git ref names
+    (alphanumeric, `/`, `.`, `-`, `_`). Rejects shell metacharacters,
+    `..` sequences (path traversal), and refs starting with `-` (flag injection).
+    """
+    if not s:
+        raise ValueError("git ref is empty")
+    if len(s) > 256:
+        raise ValueError(f"git ref too long ({len(s)} chars, max 256)")
+    if s.startswith("-"):
+        raise ValueError(
+            f"git ref '{s}' must not start with '-' (could be interpreted as a flag)"
+        )
+    if ".." in s:
+        raise ValueError(f"git ref '{s}' must not contain '..' (path traversal)")
+    allowed_chars = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/.-_~^"
+    )
+    for ch in s:
+        if ch not in allowed_chars:
+            raise ValueError(
+                f"invalid character '{ch}' in git ref '{s}': only alphanumeric, /, ., -, _, ~, ^ allowed"
+            )
+    return s
+
+
+def validate_repo_name(s: str) -> str:
+    """Validate a GitHub repository name (`owner/repo`) to prevent shell injection.
+
+    Accepts the standard GitHub `owner/repo` format where both parts contain
+    only alphanumeric characters, hyphens, underscores, and dots. Parts must
+    not start with `.` or `-` to prevent path traversal and flag injection.
+    """
+    if not s:
+        raise ValueError("repository name is empty")
+    if len(s) > 256:
+        raise ValueError(f"repository name too long ({len(s)} chars, max 256)")
+    parts = s.split("/")
+    if len(parts) != 2:
+        raise ValueError(f"invalid repository name '{s}': expected 'owner/repo' format")
+    for part in parts:
+        if not part:
+            raise ValueError(
+                f"invalid repository name '{s}': owner and repo must be non-empty"
+            )
+        if part.startswith(".") or part.startswith("-"):
+            raise ValueError(
+                f"invalid repository name '{s}': parts must not start with '.' or '-'"
+            )
+        allowed_chars = set(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+        )
+        for ch in part:
+            if ch not in allowed_chars:
+                raise ValueError(
+                    f"invalid character '{ch}' in repository name '{s}': only alphanumeric, -, _, . allowed"
+                )
+    return s
+
+
+class SweTask(BaseModel):
+    """DataForge-compatible task format for SWE mined items."""
+
+    id: str
+    repo: Annotated[str, Field(validate_default=True)] = ""
+    base_commit: Annotated[str, Field(validate_default=True)] = ""
+    merge_commit: Annotated[str, Field(validate_default=True)] = ""
+    language: str = "unknown"
+    difficulty_score: int = Field(default=1, ge=0, le=255)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    patch: str = ""
+    test_patch: str = ""
+    fail_to_pass: list[str] = Field(default_factory=list)
+    pass_to_pass: list[str] = Field(default_factory=list)
+    install_config: dict[str, str] = Field(default_factory=dict)
+    meta: dict[str, str] = Field(default_factory=dict)
+    prompt: str = ""
+    original_pr_body: str = ""
+    quality_score: float | None = None
+    quality_passed: bool = False
+    docker_passed: bool = False
+    workspace_path: str | None = None
+    status: SweTaskStatus = SweTaskStatus.CANDIDATE
+
+    @field_validator("base_commit", "merge_commit")
+    @classmethod
+    def validate_git_ref_field(cls, v: str) -> str:
+        return validate_git_ref(v) if v else v
+
+    @field_validator("repo")
+    @classmethod
+    def validate_repo_name_field(cls, v: str) -> str:
+        return validate_repo_name(v) if v else v
+
+    def has_tests(self) -> bool:
+        return bool(self.fail_to_pass or self.pass_to_pass)
