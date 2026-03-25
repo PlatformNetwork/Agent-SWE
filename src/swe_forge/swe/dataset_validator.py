@@ -108,7 +108,7 @@ async def validate_task_in_fresh_container(
     if task.install_config:
         docker_image = task.install_config.get("docker_image", "python:latest")
     else:
-        docker_image = "python:3.11-slim"  # Default, will be detected
+        docker_image = "ubuntu:22.04"  # Default, will be detected
     
     sandbox = DockerSandbox(
         docker_client=docker_client,

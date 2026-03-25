@@ -86,7 +86,7 @@ class WorkspaceConfig:
             "environment": {
                 "python_version": self.install_config.python_version.value,
                 "package_manager": self.install_config.package_manager.value,
-                "image": f"python:{self.install_config.python_version.value}-slim",
+                "image": "ubuntu:22.04",
             },
             "install": {
                 "system_packages": self.install_config.system_packages,

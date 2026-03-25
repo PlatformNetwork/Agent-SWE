@@ -85,7 +85,7 @@ SUBMISSION:
 IMPORTANT: Use `read_file`, `list_dir`, `grep_files`, `search_files` instead of shell commands
 like `cat`, `ls`, `grep`, `find` when exploring code. They return cleaner, more compact output.
 
-ENVIRONMENT: You are running in a bare `python:3.12-slim` Docker container with ONLY `git` and `python3` pre-installed.
+ENVIRONMENT: You are running in a bare `ubuntu:22.04` Docker container with ONLY `git` and `python3` pre-installed.
 You MUST install all required tools, runtimes, and dependencies yourself via `shell` before doing anything else.
 The install_commands you submit will be replayed in a FRESH container, so they must be complete and
 self-contained (include apt-get for system deps, pip install, etc.).

@@ -603,4 +603,4 @@ class DockerSandbox:
         
         # FALLBACK: Let Docker Hub resolve based on language
         # The agent should detect and use the correct image
-        return f"{language_lower}:latest"
+        return "ubuntu:22.04"

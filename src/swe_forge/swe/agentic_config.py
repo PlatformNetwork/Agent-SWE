@@ -203,7 +203,7 @@ Submit your findings using the submit_config tool.
                         install_commands=args.get("install_commands", []),
                         test_command=args.get("test_command", ""),
                         test_framework=args.get("test_framework", ""),
-                        docker_image=args.get("docker_image", f"python:{args.get('python_version', '3.11')}-slim"),
+                        docker_image=args.get("docker_image", "ubuntu:22.04"),
                         validated=True,
                     )
         
