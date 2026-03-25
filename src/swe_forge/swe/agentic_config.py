@@ -30,56 +30,76 @@ IMPORTANT: You are running on UBUNTU 22.04 base image.
 You must install Python and dependencies yourself - nothing is pre-installed.
 
 UBUNTU WORKFLOW:
-1. apt-get update && apt-get install -y python3 python3-pip python3-venv git curl
-2. Check for required Python version in pyproject.toml, .python-version
-3. If different version needed, install via deadsnakes PPA
-4. Install package manager: pip install poetry OR pip install uv
-5. Install project: poetry install OR pip install -e . OR pip install -r requirements.txt
-6. Run tests
+1. apt-get update && apt-get install -y python3 python3-pip python3-venv git curl build-essential
+2. Clone the repository
+3. Explore configuration files to understand the project
+4. Try ANY installation commands that make sense for this project
+5. Try ANY test commands that make sense for this project
 
 Your job: Analyze a GitHub repository and determine its configuration.
 
 You have access to:
-- `shell`: Execute commands to explore the repository
+- `shell`: Execute ANY command (apt-get, pip, npm, cargo, make, etc.)
 - `read_file`: Read file contents
 - `list_dir`: List directory contents
 
-STEPS:
+CRITICAL: You can run ANY custom command. Be creative and thorough!
+
+DISCOVERY APPROACH:
 1. Clone the repository at the specified commit
-2. Explore to find configuration files:
-   - pyproject.toml, setup.py, setup.cfg, requirements.txt
-   - .python-version, runtime.txt
-   - package.json, Gemfile, Cargo.toml, go.mod
+2. List directory and read configuration files:
+   - Check for: pyproject.toml, setup.py, package.json, Cargo.toml, Makefile, etc.
+   - Look for: CI configs (.github/workflows/, .gitlab-ci.yml, etc.)
+   - Read: README, CONTRIBUTING, DEVELOPMENT docs
    
-3. Detect:
-   - Python version (from requires-python or .python-version)
-   - Package manager (poetry, uv, pip, pipenv, conda)
-   - Test framework (pytest, unittest, nose, etc.)
-   - Build system (setup.py, hatch, flit, etc.)
+3. DETECT AND TRY install commands - run them and check exit code:
+   - Python: pip install -e ., poetry install, pip install -r requirements.txt, pip install ., python setup.py install
+   - Node: npm install, yarn install, pnpm install
+   - Rust: cargo build
+   - Make: make install, make setup, make deps
+   - Custom: ./setup.sh, ./install.sh, scripts/install.sh
+   - ANY other command you find in docs or CI configs
    
-4. TRY installation commands and track which ones succeed:
-   - poetry install (exit code 0?)
-   - pip install -e . (exit code 0?)
-   - pip install -r requirements.txt (exit code 0?)
-   
-5. TRY test commands and track which work:
-   - pytest --collect-only (exit code 0?)
-   - python -m pytest (exit code 0?)
-   - make test (exit code 0?)
+4. DETECT AND TRY test commands - run them and check exit code:
+   - Python: pytest, python -m pytest, python -m unittest, make test, tox
+   - Node: npm test, yarn test, npm run test
+   - Rust: cargo test
+   - Make: make test, make check
+   - Custom: ./test.sh, python tests/run_tests.py
+   - ANY other command you find in docs or CI configs
+
+5. For EACH command you try:
+   - Run it with shell tool
+   - Check exit code: 0 = SUCCESS, non-zero = FAILED
+   - If failed: Read error, try alternative, do NOT give up
+   - Track what WORKED vs what FAILED
 
 6. Return configuration via `submit_config` tool with:
-   - python_version: "3.x"
-   - package_manager: "pip|poetry|uv|pipenv|conda"
-   - install_commands: list of commands that succeeded (exit 0)
+   - python_version: "3.x" (detected from files)
+   - package_manager: "pip|poetry|uv|npm|cargo|make|custom"
+   - install_commands: list of ALL commands that succeeded (exit 0)
    - test_command: the test command that worked
-   - test_framework: "pytest|unittest|nose"
+   - test_framework: "pytest|unittest|jest|cargo|make|custom"
+
+EXAMPLES OF CUSTOM COMMANDS TO TRY:
+- pip install -e . && pip install pytest-cov
+- npm install && npm run build
+- make deps && make build
+- poetry install --no-interaction
+- pip install -e . && python -c "import package; print(package.__version__)"
+- apt-get install -y libxml2-dev libxslt1-dev && pip install -e .
+- uv pip install -e .
+- pip install . && pytest --collect-only
 
 ERROR HANDLING:
-- If install fails, read error and retry with alternative
-- If no test framework found, use "python -m pytest" as fallback
-- Report what actually worked, not what should work
+- If command fails: Read error, analyze it, try alternative
+- Read stdout AND stderr for clues
+- Check if dependencies are missing, install them
+- Check if Python version is wrong, install correct one
+- NEVER give up after one failure - try alternatives
 
 DO NOT HARDCODE: You must actually run commands and verify they work.
+REPORT ONLY WHAT WORKED: Only include commands that returned exit code 0.
 """
 
 
@@ -157,8 +177,8 @@ Commit: {commit_sha}
 Clone it, explore configuration files, and determine:
 1. Python version (try reading pyproject.toml, .python-version, runtime.txt)
 2. Package manager (look for poetry.lock, Pipfile, requirements.txt)
-3. Install commands (TRY them and report which succeed with exit code 0)
-4. Test command (TRY pytest, python -m pytest, make test)
+3. Install commands (TRY ANY commands - pip, npm, make, custom scripts, etc. Report which succeed)
+4. Test command (TRY ANY test command - pytest, npm test, make test, custom scripts)
 
 IMPORTANT: You must actually RUN commands and verify they work.
 Report ONLY commands that succeeded (exit code 0).
