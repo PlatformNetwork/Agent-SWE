@@ -26,6 +26,17 @@ logger = getLogger(__name__)
 # System prompt for agentic configuration detection
 CONFIG_DETECTION_SYSTEM_PROMPT = """You are a repository configuration analyzer.
 
+IMPORTANT: You are running on UBUNTU 22.04 base image.
+You must install Python and dependencies yourself - nothing is pre-installed.
+
+UBUNTU WORKFLOW:
+1. apt-get update && apt-get install -y python3 python3-pip python3-venv git curl
+2. Check for required Python version in pyproject.toml, .python-version
+3. If different version needed, install via deadsnakes PPA
+4. Install package manager: pip install poetry OR pip install uv
+5. Install project: poetry install OR pip install -e . OR pip install -r requirements.txt
+6. Run tests
+
 Your job: Analyze a GitHub repository and determine its configuration.
 
 You have access to:
