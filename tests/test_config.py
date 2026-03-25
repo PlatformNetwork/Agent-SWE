@@ -73,6 +73,6 @@ class TestHarnessConfig:
     def test_harness_config_defaults(self):
         """HarnessConfig should have correct default values."""
         config = HarnessConfig()
-        assert config.docker_image == "python:3.12-slim"
+        assert config.docker_image is None  # No longer hardcoded, must be detected
         assert config.agent_timeout == 600
         assert config.test_timeout == 120

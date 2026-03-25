@@ -167,7 +167,7 @@ class ContainerManager:
     Usage:
         spec = ContainerSpec(
             name="test-container",
-            image="python:3.11-slim",
+            image="python:latest"  # Agent determines,
             volumes=[VolumeMount("/host/path", "/container/path")],
             env={"FOO": "bar"},
         )

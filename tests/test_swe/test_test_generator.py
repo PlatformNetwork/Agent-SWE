@@ -632,23 +632,26 @@ class TestTestGenerator:
         assert truncated.endswith("...")
 
     def test_test_commands_for_language(self):
+        """Test that _test_commands_for_language returns empty (agentic)."""
         mock_llm = MagicMock()
         generator = TestGenerator(mock_llm)
 
+        # NO MORE HARDCODED COMMANDS - returns empty lists
+        # The agent must discover via tools
         build, test = generator._test_commands_for_language("python")
-        assert "pip install" in build[0]
-        assert "pytest" in test[0]
+        assert build == []  # Empty, agent will populate
+        assert test == []  # Empty, agent will populate
 
         build, test = generator._test_commands_for_language("javascript")
-        assert "npm install" in build[0]
-        assert "npm test" in test[0]
+        assert build == []
+        assert test == []
 
         build, test = generator._test_commands_for_language("go")
-        assert "go mod" in build[0]
-        assert "go test" in test[0]
+        assert build == []
+        assert test == []
 
         build, test = generator._test_commands_for_language("unknown")
-        assert "pip install" in build[0]
+        assert build == []  # No defaults
 
 
 class TestConstants:

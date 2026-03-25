@@ -580,37 +580,21 @@ REMEMBER:
 - Test edge cases and use DIFFERENT inputs than those in the diff (anti-hardcoding)."""
 
     def _test_commands_for_language(self, language: str) -> tuple[list[str], list[str]]:
-        """Get suggested build and test commands for a language."""
-        language = language.lower()
+        """Get suggested build and test commands for a language.
 
-        commands = {
-            "python": (
-                ["pip install -e ."],
-                ["pytest -x"],
-            ),
-            "javascript": (
-                ["npm install"],
-                ["npm test"],
-            ),
-            "typescript": (
-                ["npm install"],
-                ["npm test"],
-            ),
-            "go": (
-                ["go mod download"],
-                ["go test ./..."],
-            ),
-            "rust": (
-                ["cargo fetch"],
-                ["cargo test"],
-            ),
-            "java": (
-                ["mvn install -DskipTests"],
-                ["mvn test"],
-            ),
-        }
-
-        return commands.get(language, (["pip install -e ."], ["pytest"]))
+        DEPRECATED: This method returns EMPTY LISTS. The agent MUST discover
+        the actual commands by:
+        1. Reading pyproject.toml, setup.py, package.json, etc.
+        2. TRYING install commands and tracking which succeed (exit 0)
+        3. TRYING test commands and tracking which work
+        
+        NO HARDCODED DEFAULTS - the LLM agent figures it out via tools.
+        
+        Use agentic_config.detect_repository_config() for real detection.
+        """
+        # NO DEFAULTS - agent must discover everything
+        # Return empty lists as fallback - agent will populate via tools
+        return ([], [])
 
     async def _execute_shell(
         self, args: ShellArgs, sandbox: SandboxProtocol

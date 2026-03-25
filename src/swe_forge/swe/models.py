@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -100,7 +100,10 @@ class SweTask(BaseModel):
     test_patch: str = ""
     fail_to_pass: list[str] = Field(default_factory=list)
     pass_to_pass: list[str] = Field(default_factory=list)
-    install_config: dict[str, str] = Field(default_factory=dict)
+    install_config: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Agentic-detected install configuration"
+    )
     meta: dict[str, str] = Field(default_factory=dict)
     prompt: str = ""
     original_pr_body: str = ""
@@ -120,5 +123,16 @@ class SweTask(BaseModel):
     def validate_repo_name_field(cls, v: str) -> str:
         return validate_repo_name(v) if v else v
 
+    def is_install_ready(self) -> bool:
+        """Check if install_config has been populated by agent.
+        
+        Returns:
+            True if agent has detected working install commands.
+        """
+        return bool(
+            self.install_config.get("install_commands") or
+            self.install_config.get("commands")
+        ) and self.install_config.get("validated", False)
+    
     def has_tests(self) -> bool:
         return bool(self.fail_to_pass or self.pass_to_pass)

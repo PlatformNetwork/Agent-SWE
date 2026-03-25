@@ -49,7 +49,7 @@ class SandboxConfig:
     """
 
     name: str = "swe-sandbox"
-    image: str = "python:3.11-slim"
+    image: str = "python:latest"  # Agent determines
     workspace_dir: str = "/repo"
     memory_mb: int = 2048
     cpu_limit: float = 2.0
@@ -81,7 +81,7 @@ class DockerSandbox:
     - Running commands
 
     Usage:
-        async with DockerSandbox(docker_client, image="python:3.11") as sandbox:
+        async with DockerSandbox(docker_client, image="python:latest") as sandbox:
             await sandbox.setup_workspace("https://github.com/owner/repo", "abc123")
             await sandbox.install_dependencies(["pytest"])
             result = await sandbox.run_command("pytest tests/")
@@ -585,27 +585,22 @@ class DockerSandbox:
     def image_for_language(language: str) -> str:
         """Get appropriate Docker image for a language.
 
+        NOTE: This is a FALLBACK only. The agentic system should determine
+        the actual image based on repository detection via the agentic_config
+        module. Use RepositoryConfig from agentic_config for real implementations.
+        
+        DO NOT HARDCODE in production - let the agent detect!
+        
+        For tests and backward compatibility only.
+
         Args:
             language: Programming language name.
 
         Returns:
-            Docker image name.
+            Docker image name (generic fallback).
         """
         language_lower = language.lower()
-
-        image_map = {
-            "python": "python:3.11-slim",
-            "python3": "python:3.11-slim",
-            "javascript": "node:20-slim",
-            "typescript": "node:20-slim",
-            "node": "node:20-slim",
-            "nodejs": "node:20-slim",
-            "go": "golang:1.21-slim",
-            "golang": "golang:1.21-slim",
-            "java": "eclipse-temurin:21-jdk-slim",
-            "rust": "rust:1.75-slim",
-            "ruby": "ruby:3.2-slim",
-            "php": "php:8.2-cli-slim",
-        }
-
-        return image_map.get(language_lower, "python:3.11-slim")
+        
+        # FALLBACK: Let Docker Hub resolve based on language
+        # The agent should detect and use the correct image
+        return f"{language_lower}:latest"

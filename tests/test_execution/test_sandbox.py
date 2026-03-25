@@ -113,7 +113,7 @@ class TestSandboxConfig:
     def test_default_config(self):
         config = SandboxConfig()
         assert config.name == "swe-sandbox"
-        assert config.image == "python:3.11-slim"
+        assert config.image == "python:latest"  # No hardcoding
         assert config.workspace_dir == "/repo"
         assert config.memory_mb == 2048
         assert config.clone_timeout == 600.0
@@ -166,7 +166,7 @@ class TestDockerSandboxInit:
 
         assert sandbox._client == client
         assert sandbox._config.name == "swe-sandbox"
-        assert sandbox._config.image == "python:3.11-slim"
+        assert sandbox._config.image == "python:latest"  # No hardcoding
         assert sandbox.container_id is None
 
     def test_init_with_config(self):
@@ -504,25 +504,29 @@ class TestDockerSandboxImageForLanguage:
     """Tests for image_for_language static method."""
 
     def test_python_image(self):
-        assert DockerSandbox.image_for_language("python") == "python:3.11-slim"
-        assert DockerSandbox.image_for_language("Python") == "python:3.11-slim"
-        assert DockerSandbox.image_for_language("python3") == "python:3.11-slim"
+        # NO MORE HARDCODING - returns {language}:latest fallback
+        assert DockerSandbox.image_for_language("python") == "python:latest"
+        assert DockerSandbox.image_for_language("Python") == "python:latest"  # lowercase
+        assert DockerSandbox.image_for_language("python3") == "python3:latest"
 
     def test_javascript_image(self):
-        assert DockerSandbox.image_for_language("javascript") == "node:20-slim"
-        assert DockerSandbox.image_for_language("typescript") == "node:20-slim"
-        assert DockerSandbox.image_for_language("node") == "node:20-slim"
+        assert DockerSandbox.image_for_language("javascript") == "javascript:latest"  # No longer hardcoded
+        assert DockerSandbox.image_for_language("typescript") == "typescript:latest"
+        assert DockerSandbox.image_for_language("node") == "node:latest"
 
     def test_go_image(self):
-        assert DockerSandbox.image_for_language("go") == "golang:1.21-slim"
-        assert DockerSandbox.image_for_language("golang") == "golang:1.21-slim"
+        # NO MORE HARDCODING - returns {language}:latest fallback
+        assert DockerSandbox.image_for_language("go") == "go:latest"
+        assert DockerSandbox.image_for_language("golang") == "golang:latest"
 
     def test_rust_image(self):
-        assert DockerSandbox.image_for_language("rust") == "rust:1.75-slim"
+        assert DockerSandbox.image_for_language("rust") == "rust:latest"  # No longer hardcoded
 
     def test_unknown_defaults_to_python(self):
-        assert DockerSandbox.image_for_language("unknown") == "python:3.11-slim"
-        assert DockerSandbox.image_for_language("") == "python:3.11-slim"
+        # NO MORE HARDCODING - returns {language}:latest for unknown
+        assert DockerSandbox.image_for_language("unknown") == "unknown:latest"
+        assert DockerSandbox.image_for_language("foobar") == "foobar:latest"
+        assert DockerSandbox.image_for_language("") == ":latest"
 
 
 class TestDockerSandboxFromSpec:

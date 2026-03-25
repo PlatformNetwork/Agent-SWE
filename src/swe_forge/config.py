@@ -36,6 +36,7 @@ class PipelineConfig:
 class HarnessConfig:
     """Configuration for test harness execution."""
 
-    docker_image: str = "python:3.12-slim"
+    # DEPRECATED: Use agentic_config for image detection.
+    docker_image: str | None = None  # Agent detects, no default
     agent_timeout: int = 600
     test_timeout: int = 120
