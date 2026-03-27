@@ -7,14 +7,14 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from swe_forge.cli.harness import app, _load_tasks, _output_results, _print_summary
+from swe_forge.swe.models import SweTask
+
 
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from text."""
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
-
-from swe_forge.cli.harness import app, _load_tasks, _output_results, _print_summary
-from swe_forge.swe.models import SweTask
 
 runner = CliRunner()
 
