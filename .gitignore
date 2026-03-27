@@ -1,12 +1,30 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
 .venv/
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Project
 results/
 uv.lock
 .coverage
 .sisyphus/
 tasks/
-tasks-complete/
+tasks-complete*/
+
+# Output files
 *.jsonl
-test_*.py
+*.parquet
+
+# Test files in root
+/test_*.py
+
+# OS
+.DS_Store
+Thumbs.db
