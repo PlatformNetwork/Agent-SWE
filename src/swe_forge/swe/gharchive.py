@@ -269,11 +269,16 @@ class GhArchiveClient:
                 continue
 
             payload = event.get("payload", {})
-            if payload.get("action") != "closed":
-                continue
+            action = payload.get("action", "")
 
-            pr = payload.get("pull_request", {})
-            if not pr.get("merged", False):
+            # Accept both "merged" action and "closed" with merged=True
+            if action == "merged":
+                pass
+            elif action == "closed":
+                pr = payload.get("pull_request", {})
+                if not pr.get("merged", False):
+                    continue
+            else:
                 continue
 
             parsed = self._parse_pr_event(event)

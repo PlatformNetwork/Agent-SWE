@@ -90,6 +90,7 @@ class PullRequest:
     additions: int
     deletions: int
     changed_files: int
+    stars: int = 0
 
     @classmethod
     def from_api_response(cls, data: dict[str, Any]) -> "PullRequest":
@@ -112,6 +113,7 @@ class PullRequest:
             additions=data.get("additions", 0),
             deletions=data.get("deletions", 0),
             changed_files=data.get("changed_files", 0),
+            stars=data.get("base", {}).get("repo", {}).get("stargazers_count", 0),
         )
 
 
@@ -400,6 +402,113 @@ class GitHubClient:
 
         _, _, text = await self._request("GET", url, headers=headers)
         return text
+
+    @retry(
+        retry=retry_if_exception_type(
+            (aiohttp.ClientError, ServerError, RateLimitError)
+        ),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=True,
+    )
+    async def get_file_content(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str | None = None,
+    ) -> str | None:
+        """Fetch file content from a repository.
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            path: File path in the repository.
+            ref: Git ref (branch, tag, or commit). Defaults to default branch.
+
+        Returns:
+            File content as string, or None if file doesn't exist.
+        """
+        import base64
+        import json
+
+        url = f"{self.BASE_URL}/repos/{owner}/{repo}/contents/{path}"
+        if ref:
+            url = f"{url}?ref={ref}"
+
+        try:
+            _, _, text = await self._request("GET", url)
+            data = json.loads(text)
+
+            if isinstance(data, dict) and data.get("type") == "file":
+                content = data.get("content", "")
+                if content:
+                    return base64.b64decode(content).decode("utf-8", errors="replace")
+            return None
+        except NotFoundError:
+            return None
+
+    async def get_ci_cd_files(
+        self,
+        owner: str,
+        repo: str,
+        ref: str | None = None,
+    ) -> dict[str, str]:
+        """Fetch CI/CD configuration files from a repository.
+
+        Fetches common CI/CD files:
+        - .github/workflows/*.yml (GitHub Actions)
+        - .gitlab-ci.yml
+        - Dockerfile
+        - Makefile
+        - pyproject.toml
+        - setup.py
+        - package.json
+        - Cargo.toml
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            ref: Git ref (branch, tag, or commit).
+
+        Returns:
+            Dict mapping filename to content for files that exist.
+        """
+        files: dict[str, str] = {}
+
+        # CI/CD config paths to check
+        ci_paths = [
+            ".github/workflows/ci.yml",
+            ".github/workflows/test.yml",
+            ".github/workflows/main.yml",
+            ".github/workflows/build.yml",
+            ".github/workflows/python-package.yml",
+            ".gitlab-ci.yml",
+            "Dockerfile",
+            "Makefile",
+            "pyproject.toml",
+            "setup.py",
+            "package.json",
+            "Cargo.toml",
+            "go.mod",
+            "pom.xml",
+            "build.gradle",
+        ]
+
+        # Fetch files in parallel
+        import asyncio
+
+        async def fetch_file(path: str) -> tuple[str, str | None]:
+            content = await self.get_file_content(owner, repo, path, ref)
+            return path, content
+
+        results = await asyncio.gather(*[fetch_file(p) for p in ci_paths])
+
+        for path, content in results:
+            if content is not None:
+                files[path] = content
+
+        return files
 
     async def get_rate_limit(self) -> RateLimitInfo:
         """Fetch current rate limit status.

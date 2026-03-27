@@ -237,7 +237,7 @@ async def enrich_pr(
         deletions=total_deletions,
         changed_files=changed_paths,
         language=language,
-        stars=event.stars,
+        stars=pr_data.stars if pr_data else event.stars,
         is_bot=is_bot(user_login),
         linked_issues=extract_linked_issues(body_text),
         metadata=metadata,

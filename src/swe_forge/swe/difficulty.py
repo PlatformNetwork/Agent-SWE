@@ -179,7 +179,7 @@ def get_score_for_difficulty(difficulty: str) -> float:
 class DifficultyClassifier:
     """LLM-based difficulty classifier for SWE tasks."""
 
-    def __init__(self, client: LLMClient, model: str = "openai/gpt-4o-mini"):
+    def __init__(self, client: LLMClient, model: str = "moonshotai/kimi-k2.5"):
         self._client = client
         self._model = model
 
