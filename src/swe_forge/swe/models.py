@@ -101,8 +101,7 @@ class SweTask(BaseModel):
     fail_to_pass: list[str] = Field(default_factory=list)
     pass_to_pass: list[str] = Field(default_factory=list)
     install_config: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Agentic-detected install configuration"
+        default_factory=dict, description="Agentic-detected install configuration"
     )
     meta: dict[str, str] = Field(default_factory=dict)
     prompt: str = ""
@@ -125,14 +124,14 @@ class SweTask(BaseModel):
 
     def is_install_ready(self) -> bool:
         """Check if install_config has been populated by agent.
-        
+
         Returns:
             True if agent has detected working install commands.
         """
         return bool(
-            self.install_config.get("install_commands") or
-            self.install_config.get("commands")
+            self.install_config.get("install_commands")
+            or self.install_config.get("commands")
         ) and self.install_config.get("validated", False)
-    
+
     def has_tests(self) -> bool:
         return bool(self.fail_to_pass or self.pass_to_pass)
