@@ -85,20 +85,27 @@ SUBMISSION:
 IMPORTANT: Use `read_file`, `list_dir`, `grep_files`, `search_files` instead of shell commands
 like `cat`, `ls`, `grep`, `find` when exploring code. They return cleaner, more compact output.
 
-ENVIRONMENT: You are running in a bare `ubuntu:22.04` Docker container with ONLY `git` and `python3` pre-installed.
-You MUST install all required tools, runtimes, and dependencies yourself via `shell` before doing anything else.
+ENVIRONMENT: You are running in a `ubuntu:24.04` Docker container.
+You MUST first install Python and git via: apt-get update && apt-get install -y python3 python3-pip git
+Then install all required dependencies yourself via `shell` before running tests.
 The install_commands you submit will be replayed in a FRESH container, so they must be complete and
-self-contained (include apt-get for system deps, pip install, etc.).
+self-contained (apt-get install, pip install, etc.).
+
+IMPORTANT: 
+- Write test files RELATIVE to the repo root: test_swe_<feature>.py
+- Test command: pytest -c /dev/null test_swe_<feature>.py -v
+- The `-c /dev/null` flag is CRITICAL - it skips pyproject.toml config which may have incompatible plugins.
 
 WORKFLOW:
-1. SETUP — INSTALL DEPENDENCIES (this is critical!):
-   a. First, explore the repo to determine the correct installation procedure:
+1. SETUP — INSTALL PYTHON AND DEPENDENCIES (this is critical!):
+   a. First install Python and git: apt-get update && apt-get install -y python3 python3-pip git
+   b. Explore the repo to determine the correct installation procedure:
       - Check README.md, CONTRIBUTING.md, Makefile, Dockerfile, docker-compose.yml
       - Check setup.py, pyproject.toml, setup.cfg (Python)
       - Check package.json (JavaScript/TypeScript)
-   b. Run installation commands via `shell` and carefully track which ones SUCCEED (exit code 0).
-   c. If the first install attempt fails, read error output, fix the issue, and retry.
-   d. ONLY include commands that exited with code 0 in your `install_commands` submission.
+   c. Run installation commands via `shell` and carefully track which ones SUCCEED (exit code 0).
+   d. If the first install attempt fails, read error output, fix the issue, and retry.
+   e. ONLY include commands that exited with code 0 in your `install_commands` submission.
 2. Use `shell` to explore the repo: project structure, existing tests, build system, dependencies.
 3. Read the PR diff carefully: understand WHAT changed and WHY.
 4. Find existing test suites covering code ADJACENT to the PR changes -- add them as pass_to_pass.
@@ -515,6 +522,7 @@ class TestGenerator:
         model: str = "",
         temperature: float = 0.2,
         max_tokens: int = 2000,
+        max_context_tokens: int = 100000,
     ):
         """Initialize TestGenerator.
 
@@ -524,12 +532,14 @@ class TestGenerator:
             model: Model identifier to use.
             temperature: Generation temperature (default: 0.2).
             max_tokens: Maximum tokens per response (default: 2000).
+            max_context_tokens: Maximum context tokens before compaction (default: 100k).
         """
         self._llm = llm
         self._max_turns = max_turns
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
+        self._max_context_tokens = max_context_tokens
         self._written_files: list[TestFile] = []
 
     def _get_tools(self) -> list[ToolDefinition]:
@@ -587,9 +597,9 @@ REMEMBER:
         1. Reading pyproject.toml, setup.py, package.json, etc.
         2. TRYING install commands and tracking which succeed (exit 0)
         3. TRYING test commands and tracking which work
-        
+
         NO HARDCODED DEFAULTS - the LLM agent figures it out via tools.
-        
+
         Use agentic_config.detect_repository_config() for real detection.
         """
         # NO DEFAULTS - agent must discover everything
@@ -604,8 +614,10 @@ REMEMBER:
 
         try:
             result = await sandbox.run_command(args.command, timeout=timeout_sec)
+            stdout = self._truncate(result.stdout, 3000)
+            stderr = self._truncate(result.stderr, 1500)
             return ToolResult(
-                content=f"Exit code: {result.exit_code}\n\nStdout:\n{result.stdout}\n\nStderr:\n{result.stderr}",
+                content=f"Exit code: {result.exit_code}\n\nStdout:\n{stdout}\n\nStderr:\n{stderr}",
                 is_error=result.exit_code != 0,
             )
         except Exception as e:
@@ -647,16 +659,21 @@ REMEMBER:
         path = arguments.get("path", "")
 
         if not path:
-            return ToolResult(content="Error: missing path parameter", is_error=True)
+            return ToolResult(content="Error: missing file path", is_error=True)
 
         try:
             content = await sandbox.read_file(path)
 
-            # Add line numbers
             lines = content.splitlines()
-            numbered = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+            numbered = "\n".join(
+                f"{i + 1}: {line}" for i, line in enumerate(lines[:200])
+            )
+            if len(lines) > 200:
+                numbered += f"\n... [{len(lines) - 200} more lines truncated]"
 
-            return ToolResult(content=f"File: {path}\n\n{numbered}")
+            return ToolResult(
+                content=self._truncate(f"File: {path}\n\n{numbered}", 5000)
+            )
         except Exception as e:
             return ToolResult(content=f"Failed to read {path}: {e}", is_error=True)
 
@@ -676,6 +693,8 @@ REMEMBER:
             )
         except json.JSONDecodeError as e:
             return ToolResult(content=f"Invalid JSON arguments: {e}", is_error=True)
+
+        logger.debug(f"Tool call: {tool_name} with args: {list(arguments.keys())}")
 
         if tool_name == "shell":
             try:
@@ -701,7 +720,7 @@ REMEMBER:
             path = arguments.get("path", ".")
             try:
                 result = await sandbox.run_command(f"ls -la {path}")
-                return ToolResult(content=result.stdout)
+                return ToolResult(content=self._truncate(result.stdout, 3000))
             except Exception as e:
                 return ToolResult(
                     content=f"Error listing directory: {e}", is_error=True
@@ -711,8 +730,10 @@ REMEMBER:
             pattern = arguments.get("pattern", "")
             path = arguments.get("path", ".")
             try:
-                result = await sandbox.run_command(f"grep -rn '{pattern}' {path}")
-                return ToolResult(content=result.stdout)
+                result = await sandbox.run_command(
+                    f"grep -rn '{pattern}' {path} | head -100"
+                )
+                return ToolResult(content=self._truncate(result.stdout, 5000))
             except Exception as e:
                 return ToolResult(content=f"Error grepping: {e}", is_error=True)
 
@@ -720,8 +741,10 @@ REMEMBER:
             pattern = arguments.get("pattern", "*")
             path = arguments.get("path", ".")
             try:
-                result = await sandbox.run_command(f"find {path} -name '{pattern}'")
-                return ToolResult(content=result.stdout)
+                result = await sandbox.run_command(
+                    f"find {path} -name '{pattern}' | head -100"
+                )
+                return ToolResult(content=self._truncate(result.stdout, 2000))
             except Exception as e:
                 return ToolResult(content=f"Error searching: {e}", is_error=True)
 
@@ -744,6 +767,9 @@ REMEMBER:
                 return ToolResult(content=f"Error applying patch: {e}", is_error=True)
 
         elif tool_name == "submit_tests":
+            logger.info(
+                f"submit_tests called with: fail_to_pass={arguments.get('fail_to_pass')}, install_commands={arguments.get('install_commands')}"
+            )
             return self._handle_submit_tests(arguments)
 
         else:
@@ -800,20 +826,23 @@ REMEMBER:
         Raises:
             RuntimeError: If the turn limit is exhausted without successful generation.
         """
-        loop = AgenticLoop(max_turns=self._max_turns)
+        loop = AgenticLoop(
+            max_turns=self._max_turns,
+            max_context_tokens=self._max_context_tokens,
+        )
         self._written_files = []
         validation_retries = 0
 
         tools = self._get_tools()
 
-        # Initialize conversation
         loop.add_system(SYSTEM_PROMPT)
 
         user_msg = self._build_user_message(task)
         loop.add_user(user_msg)
 
         while not loop.is_exhausted():
-            # Generate response
+            loop.compact_if_needed(self._llm, self._model)
+
             request = GenerationRequest(
                 model=self._model,
                 messages=loop.messages,
