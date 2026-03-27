@@ -1,0 +1,2 @@
+npm test -- src/app.controller.spec.ts
+npm run build

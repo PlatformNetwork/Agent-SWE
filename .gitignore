@@ -5,10 +5,13 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+.cache/
 
 # IDE
-.vscode/
 .idea/
+.vscode/
+*.swp
+*.swo
 
 # Project
 results/
@@ -21,9 +24,52 @@ tasks-complete*/
 # Output files
 *.jsonl
 *.parquet
+*.log
 
 # Test files in root
 /test_*.py
+test-outputs/
+test-run/
+agent-tests/
+test-easy-output/
+
+# Generated outputs
+/factory-output/
+/devops-output/
+/security-output/
+/algorithms-output/
+/collected/
+/output/
+outputs/
+generated-datasets/
+generated-swe/
+/swe-datasets/
+/test-run-hard/
+run-easy/
+run-medium/
+run-hard/
+
+# SQLite cache files
+*.db
+*.db-shm
+*.db-wal
+
+# Benchmark artifacts
+benchmark_*.json
+benchmark_*.log
+benchmark_*.md
+validation_summary.json
+validated-dataset/
+benchmark-output/
+
+# Mission artifacts
+.factory/
+handoffs/
+hf-tasks/
+
+# Build
+/target/
+*.rs.bk
 
 # OS
 .DS_Store

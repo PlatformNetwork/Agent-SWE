@@ -1,0 +1,3 @@
+#!/bin/bash
+# This test must FAIL on base commit, PASS after fix
+cd tests/unit/helm && go test -count=1 -tags unit -run TestHelmChartVersionsMatchRelease ./...

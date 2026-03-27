@@ -1,0 +1,2 @@
+pytest tests/test_timeout_behavior.py
+pytest tests/test_cli_pool.py -k "not test_rejects_code_execution"

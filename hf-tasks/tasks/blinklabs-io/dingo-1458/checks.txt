@@ -1,0 +1,5 @@
+go test ./blockfrost -run TestParsePaginationDefaultsAndClamping
+go test ./blockfrost -run TestParsePaginationInvalidValues
+go test ./blockfrost -run TestSetPaginationHeadersTotals
+go test ./blockfrost -run TestSetPaginationHeadersDefaultsOnInvalidCount
+go test ./chainsync

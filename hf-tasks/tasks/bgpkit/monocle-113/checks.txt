@@ -1,0 +1,2 @@
+. $HOME/.cargo/env && cargo test --test xdg_paths -- --nocapture
+. $HOME/.cargo/env && cargo test test_ttl_durations -- --nocapture

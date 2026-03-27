@@ -1,0 +1,2 @@
+pnpm vitest run packages/markdown/__tests__/tilde-code-block.spec.ts
+pnpm vitest run packages/markdown/__tests__/manager.spec.ts
