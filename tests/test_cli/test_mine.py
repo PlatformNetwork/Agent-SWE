@@ -43,7 +43,7 @@ class TestMineCommandParsing:
 
     def test_mine_help(self):
         """Test that --help works and shows expected options."""
-        result = runner.invoke(mine_app, ["--help"])
+        result = runner.invoke(mine_app, ["mine", "--help"])
         assert result.exit_code == 0
         assert "repo" in result.output.lower() or "--repo" in result.output
         assert "limit" in result.output.lower() or "--limit" in result.output
@@ -59,7 +59,7 @@ class TestMineCommandParsing:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, [])
+            result = runner.invoke(mine_app, ["mine"])
             assert result.exit_code == 0
 
     def test_mine_with_repo_option(self):
@@ -73,7 +73,7 @@ class TestMineCommandParsing:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--repo", "owner/repo"])
+            result = runner.invoke(mine_app, ["mine", "--repo", "owner/repo"])
             assert result.exit_code == 0
 
     def test_mine_with_limit(self):
@@ -87,7 +87,7 @@ class TestMineCommandParsing:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--limit", "5"])
+            result = runner.invoke(mine_app, ["mine", "--limit", "5"])
             assert result.exit_code == 0
 
     def test_mine_with_output(self):
@@ -101,7 +101,7 @@ class TestMineCommandParsing:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--output", "/tmp/test.jsonl"])
+            result = runner.invoke(mine_app, ["mine", "--output", "/tmp/test.jsonl"])
             assert result.exit_code == 0
 
     def test_mine_with_difficulty(self):
@@ -115,7 +115,7 @@ class TestMineCommandParsing:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--difficulty", "easy"])
+            result = runner.invoke(mine_app, ["mine", "--difficulty", "easy"])
             assert result.exit_code == 0
 
     def test_mine_with_model(self):
@@ -129,7 +129,7 @@ class TestMineCommandParsing:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--model", "gpt-4"])
+            result = runner.invoke(mine_app, ["mine", "--model", "gpt-4"])
             assert result.exit_code == 0
 
     def test_mine_once_flag(self):
@@ -143,7 +143,7 @@ class TestMineCommandParsing:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--once"])
+            result = runner.invoke(mine_app, ["mine", "--once"])
             assert result.exit_code == 0
 
     def test_mine_continuous_flag(self):
@@ -157,7 +157,7 @@ class TestMineCommandParsing:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--continuous"])
+            result = runner.invoke(mine_app, ["mine", "--continuous"])
             assert result.exit_code == 0
 
 
@@ -166,18 +166,18 @@ class TestMineCommandValidation:
 
     def test_invalid_repo_format(self):
         """Test that invalid repo format exits with error."""
-        result = runner.invoke(mine_app, ["--repo", "invalidrepo"])
+        result = runner.invoke(mine_app, ["mine", "--repo", "invalidrepo"])
         assert result.exit_code == 1
         assert "owner/repo" in result.output
 
     def test_invalid_difficulty(self):
         """Test that invalid difficulty exits with error."""
-        result = runner.invoke(mine_app, ["--difficulty", "impossible"])
+        result = runner.invoke(mine_app, ["mine", "--difficulty", "impossible"])
         assert result.exit_code == 1
 
     def test_limit_too_low(self, caplog):
         """Test that limit below minimum shows error."""
-        result = runner.invoke(mine_app, ["--limit", "0"])
+        result = runner.invoke(mine_app, ["mine", "--limit", "0"])
         assert result.exit_code != 0
 
 
@@ -207,7 +207,7 @@ class TestMineCommandIntegration:
                 prompt="Test prompt",
             )
             mock_run.return_value = MockResult(tasks=[task], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--output", str(output_file)])
+            result = runner.invoke(mine_app, ["mine", "--output", str(output_file)])
             assert result.exit_code == 0
             assert output_file.exists()
 
@@ -222,7 +222,7 @@ class TestMineCommandIntegration:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--verbose"])
+            result = runner.invoke(mine_app, ["mine", "--verbose"])
             assert result.exit_code == 0
 
     def test_language_option(self):
@@ -236,7 +236,7 @@ class TestMineCommandIntegration:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--language", "typescript"])
+            result = runner.invoke(mine_app, ["mine", "--language", "typescript"])
             assert result.exit_code == 0
 
     def test_min_stars_option(self):
@@ -250,7 +250,7 @@ class TestMineCommandIntegration:
                 benchmark_metrics: object = None
 
             mock_run.return_value = MockResult(tasks=[], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["--min-stars", "50"])
+            result = runner.invoke(mine_app, ["mine", "--min-stars", "50"])
             assert result.exit_code == 0
 
 

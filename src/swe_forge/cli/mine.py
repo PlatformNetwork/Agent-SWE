@@ -7,6 +7,7 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -34,6 +35,7 @@ from swe_forge.swe.pipeline import (
     SwePipelineEvent,
     SwePipelineEventType,
 )
+from swe_forge.swe.concurrency import set_docker_containers_limit
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +94,7 @@ def mine(
             "-m",
             help="LLM model for classification",
         ),
-    ] = "gpt-4",
+    ] = "moonshotai/kimi-k2.5",
     once: Annotated[
         bool,
         typer.Option(
@@ -120,7 +122,7 @@ def mine(
             "--min-stars",
             help="Minimum repository stars required",
         ),
-    ] = 20,
+    ] = 100,
     language: Annotated[
         Optional[str],
         typer.Option(
@@ -128,6 +130,14 @@ def mine(
             help="Filter by programming language",
         ),
     ] = None,
+    filter_json: Annotated[
+        str,
+        typer.Option(
+            "--filter",
+            "-f",
+            help='JSON filter for max tasks per difficulty. Default: {"easy": 10, "medium": 10, "hard": 10}',
+        ),
+    ] = '{"easy": 10, "medium": 10, "hard": 10}',
     verbose: Annotated[
         bool,
         typer.Option(
@@ -136,6 +146,31 @@ def mine(
             help="Enable verbose logging",
         ),
     ] = False,
+    parallel: Annotated[
+        int,
+        typer.Option(
+            "--parallel",
+            "-p",
+            help="Maximum concurrent Docker containers",
+            min=1,
+        ),
+    ] = 8,
+    output_folder: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-folder",
+            "-O",
+            help="Output folder for workspace format export",
+        ),
+    ] = None,
+    docker_username: Annotated[
+        str | None,
+        typer.Option(
+            "--docker-username",
+            "-D",
+            help="Docker Hub username for image names (user -> user/swe-forge-tasks:task-id)",
+        ),
+    ] = None,
 ) -> None:
     """Mine SWE tasks from GitHub repositories.
 
@@ -151,6 +186,9 @@ def mine(
     logging.basicConfig(
         level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
+
+    # Configure Docker container parallelism
+    set_docker_containers_limit(parallel)
 
     # Validate repo format if provided
     if repo and not validate_repo_format(repo):
@@ -178,6 +216,14 @@ def mine(
     languages = [language.lower()] if language else ["python"]
     difficulty_filter = difficulty.lower() if difficulty else None
 
+    try:
+        filter_config = json.loads(filter_json)
+    except json.JSONDecodeError:
+        console.print("[red]Error: Invalid JSON in --filter option[/red]")
+        raise typer.Exit(code=1)
+
+    difficulty_targets = DifficultyTargets(targets=filter_config)
+
     config = SwePipelineConfig(
         max_candidates=max_candidates,
         max_tasks=limit,
@@ -185,6 +231,7 @@ def mine(
         min_stars=min_stars,
         languages=languages,
         difficulty_filter=difficulty_filter,
+        difficulty_targets=difficulty_targets,
     )
 
     # Get GitHub token from environment
@@ -200,6 +247,8 @@ def mine(
     console.print(f"  Mode: {'Continuous' if continuous else 'Once'}")
     console.print(f"  Min Stars: {min_stars}")
     console.print(f"  Language: {language or 'python'}")
+    console.print(f"  Filter: {filter_json}")
+    console.print(f"  Parallel: {parallel} containers")
     console.print()
 
     # Run the pipeline
@@ -212,6 +261,14 @@ def mine(
             console.print(
                 f"\n[green]Exported {len(result.tasks)} tasks to {output}[/green]"
             )
+
+            if output_folder:
+                from swe_forge.export.workspace import export_tasks_to_workspace
+
+                export_tasks_to_workspace(
+                    result.tasks, output_folder, docker_username=docker_username
+                )
+                console.print(f"[green]Workspace export: {output_folder}[/green]")
 
             # Print summary
             if result.benchmark_metrics:
@@ -280,6 +337,144 @@ async def _run_pipeline(
                     progress.update(task_id, completed=len(tasks))
 
     return PipelineResult(tasks=tasks, benchmark_metrics=metrics)
+
+
+@app.command("complete")
+def mine_complete(
+    repo: Annotated[
+        str,
+        typer.Option(
+            "--repo",
+            "-r",
+            help="Target repository in owner/repo format",
+        ),
+    ],
+    pr: Annotated[
+        int,
+        typer.Option(
+            "--pr",
+            "-p",
+            help="Pull request number to mine",
+        ),
+    ],
+    output: Annotated[
+        str,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output file path for JSONL results",
+        ),
+    ] = "./tasks.jsonl",
+    llm_model: Annotated[
+        str,
+        typer.Option(
+            "--model",
+            "-m",
+            help="LLM model for test generation",
+        ),
+    ] = "openai/gpt-5.4",
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Enable verbose logging",
+        ),
+    ] = False,
+) -> None:
+    """Complete A-Z mining with Docker verification.
+
+    Runs the full pipeline:
+    1. Fetch PR from GitHub
+    2. Detect language
+    3. Discover commands from CI/CD
+    4. Generate tests via LLM
+    5. Verify tests fail before patch
+    6. Apply patch
+    7. Verify tests pass after patch
+    8. Export validated task
+
+    Only exports if ALL verification checks pass.
+    """
+    log_level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if not github_token:
+        console.print("[red]Error: GITHUB_TOKEN environment variable not set[/red]")
+        raise typer.Exit(code=1)
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+
+    console.print(f"[bold blue]Complete Mining Pipeline[/bold blue]")
+    console.print(f"  Repository: {repo}")
+    console.print(f"  PR: #{pr}")
+    console.print(f"  Model: {llm_model}")
+    console.print(f"  Output: {output}")
+    console.print()
+
+    try:
+        result = asyncio.run(
+            _run_complete_mining(
+                repo, pr, output, llm_model, github_token, openrouter_key
+            )
+        )
+
+        if result:
+            console.print(f"\n[green]✅ Task validated: {result.task.id}[/green]")
+            console.print(
+                f"   Tests before: {'FAILED' if not result.before_tests_passed else 'PASSED'}"
+            )
+            console.print(
+                f"   Tests after: {'PASSED' if result.after_tests_passed else 'FAILED'}"
+            )
+            console.print(f"   Exported to: {output}")
+        else:
+            console.print("\n[red]❌ Task failed verification[/red]")
+            raise typer.Exit(code=1)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Mining interrupted by user[/yellow]")
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}")
+        console.print(f"\n[red]Error: {e}[/red]")
+        raise typer.Exit(code=1)
+
+
+async def _run_complete_mining(
+    repo: str,
+    pr_number: int,
+    output: str,
+    model: str,
+    github_token: str,
+    openrouter_key: str,
+) -> "ValidatedTask | None":
+    """Run the complete mining pipeline."""
+    from swe_forge.pipeline import CompleteMiningPipeline
+    from swe_forge.llm.openrouter import OpenRouterClient
+
+    llm_client = None
+    if openrouter_key:
+        llm_client = OpenRouterClient(api_key=openrouter_key, default_model=model)
+
+    async with GitHubClient(token=github_token) as gh:
+        pipeline = CompleteMiningPipeline(
+            gh_client=gh,
+            llm_client=llm_client,
+            model=model,
+        )
+
+        result = await pipeline.mine_pr(repo, pr_number)
+
+        if result:
+            from pathlib import Path
+            from swe_forge.export.jsonl import export_jsonl
+
+            export_jsonl([result.task], Path(output), append=True)
+
+        return result
 
 
 if __name__ == "__main__":
