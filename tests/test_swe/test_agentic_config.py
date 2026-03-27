@@ -1,6 +1,5 @@
 """Tests for agentic configuration detection - NO HARDCODING."""
 
-
 from swe_forge.swe.agentic_config import (
     RepositoryConfig,
     SubmitConfigArgs,

@@ -1,4 +1,3 @@
-
 import pytest
 
 from swe_forge.swe.models import (

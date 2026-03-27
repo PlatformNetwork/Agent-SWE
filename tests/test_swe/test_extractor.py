@@ -1,6 +1,5 @@
 """Tests for patch extraction functionality."""
 
-
 from swe_forge.swe.extractor import (
     ExtractedPatch,
     count_line_delta,

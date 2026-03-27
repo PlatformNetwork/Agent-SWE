@@ -514,7 +514,6 @@ class TestTestGenerator:
             prompt="Test",
         )
 
-
         invalid_submit = ToolCall(
             id="call_submit",
             type="function",

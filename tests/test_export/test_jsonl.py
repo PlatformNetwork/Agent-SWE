@@ -1,4 +1,3 @@
-
 import pytest
 
 from swe_forge.export.jsonl import export_jsonl, import_jsonl, stream_jsonl
