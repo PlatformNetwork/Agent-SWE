@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -68,7 +69,10 @@ def _swe_task_to_record(task: SweTask) -> dict:
         "test_patch": task.test_patch,
         "fail_to_pass": task.fail_to_pass,
         "pass_to_pass": task.pass_to_pass,
-        "install_config": list(task.install_config.items()),
+        "install_config": [
+            (k, json.dumps(v) if not isinstance(v, str) else v)
+            for k, v in task.install_config.items()
+        ],
         "meta": list(task.meta.items()),
         "prompt": task.prompt,
         "original_pr_body": task.original_pr_body,

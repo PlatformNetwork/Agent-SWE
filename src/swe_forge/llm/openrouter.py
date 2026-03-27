@@ -184,7 +184,7 @@ class OpenRouterClient(LLMClient):
                     )
 
             # Use first tool call arguments as content for structured output backcompat
-            content = message_data.get("content", "")
+            content = message_data.get("content") or ""
             if not content and tool_calls:
                 first_call = tool_calls[0]
                 if first_call.function.arguments:
@@ -200,7 +200,7 @@ class OpenRouterClient(LLMClient):
                 Choice(
                     index=choice_data.get("index", 0),
                     message=message,
-                    finish_reason=choice_data.get("finish_reason", "stop"),
+                    finish_reason=choice_data.get("finish_reason") or "stop",
                 )
             )
 

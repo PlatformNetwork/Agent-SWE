@@ -165,7 +165,7 @@ class Choice(BaseModel):
 
     index: int
     message: Message
-    finish_reason: str
+    finish_reason: str | None = "stop"
 
 
 class GenerationResponse(BaseModel):
