@@ -330,17 +330,43 @@ async def build_images_for_tasks(
 def task_to_dict(task: Any) -> dict[str, Any]:
     """Convert a SweTask object to dictionary for image building.
 
+    The output format is compatible with generate_dockerfile which expects:
+    - repo: {"url": "...", "base_commit": "...", "merge_commit": "..."}
+
     Args:
         task: SweTask instance or dict
 
     Returns:
-        Task as dictionary
+        Task as dictionary in workspace format
     """
     if hasattr(task, "model_dump"):
-        return task.model_dump()
+        data = task.model_dump()
     elif hasattr(task, "to_dict"):
-        return task.to_dict()
+        data = task.to_dict()
     elif isinstance(task, dict):
-        return task
+        data = task.copy()
     else:
         raise ValueError(f"Cannot convert {type(task)} to dict")
+
+    # Transform SweTask format to workspace format
+    # SweTask has: repo="owner/repo", base_commit="abc"
+    # Workspace has: repo={"url": "https://github.com/owner/repo.git", "base_commit": "abc"}
+    if "repo" in data and isinstance(data["repo"], str):
+        repo_str = data["repo"]
+        base_commit = data.get("base_commit", "")
+        merge_commit = data.get("merge_commit", "")
+
+        # Convert "owner/repo" to full URL
+        if "/" in repo_str and not repo_str.startswith("http"):
+            repo_url = f"https://github.com/{repo_str}.git"
+        else:
+            repo_url = repo_str
+
+        # Replace string repo with dict format
+        data["repo"] = {
+            "url": repo_url,
+            "base_commit": base_commit,
+            "merge_commit": merge_commit,
+        }
+
+    return data
