@@ -42,15 +42,13 @@ def export_task_to_workspace(
         f"{docker_username}/swe-forge-tasks:{task.id}" if docker_username else None
     )
 
-    # Get install commands from config or defaults
+    # Get install commands from config - NO FALLBACKS
     install_commands = task.install_config.get("install_commands", [])
     if not install_commands:
-        if task.language == "python":
-            install_commands = ["pip install -e .", "pip install pytest"]
-        elif task.language in ("javascript", "typescript"):
-            install_commands = ["npm install", "npm test"]
-        elif task.language == "rust":
-            install_commands = ["cargo build", "cargo test"]
+        raise DiscoveryError(
+            f"No install commands discovered for task {task.id}. "
+            "Ensure LLM-based discovery is configured (OPENROUTER_API_KEY)."
+        )
 
     # Get test commands - fallback to test_patch extraction if empty
     fail_to_pass = list(task.fail_to_pass) if task.fail_to_pass else []
@@ -62,14 +60,12 @@ def export_task_to_workspace(
         if test_files:
             fail_to_pass = [f"pytest {f} -v" for f in test_files]
 
-    # Default test commands as last resort
+    # No fallback test commands - require LLM discovery
     if not fail_to_pass:
-        if task.language == "python":
-            fail_to_pass = ["pytest tests/ -v"]
-        elif task.language in ("javascript", "typescript"):
-            fail_to_pass = ["npm test"]
-        elif task.language == "rust":
-            fail_to_pass = ["cargo test"]
+        raise DiscoveryError(
+            f"No test commands discovered for task {task.id}. "
+            "Ensure TestGenerator is configured and ran successfully."
+        )
 
     # Build workspace data
     workspace_data: dict[str, Any] = {

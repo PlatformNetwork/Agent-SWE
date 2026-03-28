@@ -108,10 +108,9 @@ class AgenticCommandDiscovery:
                 f.endswith("setup.py") or f == "setup.py" for f in filenames
             )
             if has_pyproject or has_setup:
-                discovered.install_commands = ["pip install -e ."]
+                # Don't hardcode commands - let LLM discover them
                 discovered.discovery_source = "python-package"
-                discovered.confidence = "high"
-                return discovered
+                # Continue to LLM discovery below instead of returning early
 
         # Step 1: Read CI/CD for tested commands
         ci_commands = self._extract_ci_install_commands(files, language)

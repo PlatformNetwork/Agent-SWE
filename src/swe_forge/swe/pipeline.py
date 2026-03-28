@@ -301,12 +301,13 @@ class SwePipeline:
                 response: TriageResponse = await classifier.classify_triage(pr_info)
                 difficulty = response.difficulty
             else:
-                if enriched.files_changed <= 2:
-                    difficulty = "easy"
-                elif enriched.files_changed <= 5:
-                    difficulty = "medium"
-                else:
-                    difficulty = "hard"
+                # NO HARDCODED HEURISTICS - skip if no classifier
+                logger.warning(
+                    "No classifier for %s#%d, skipping pre-classification",
+                    enriched.repo,
+                    enriched.number,
+                )
+                return None
 
             if difficulty == "easy":
                 metrics.preclassify_easy += 1
@@ -395,15 +396,13 @@ class SwePipeline:
                         else:
                             metrics.difficulty_hard += 1
                     else:
-                        if enriched.files_changed <= 2:
-                            task.difficulty_score = 1
-                            metrics.difficulty_easy += 1
-                        elif enriched.files_changed <= 5:
-                            task.difficulty_score = 2
-                            metrics.difficulty_medium += 1
-                        else:
-                            task.difficulty_score = 3
-                            metrics.difficulty_hard += 1
+                        # NO HARDCODED HEURISTICS - skip difficulty scoring
+                        task.difficulty_score = 0
+                        logger.warning(
+                            "No difficulty classifier for %s#%d, skipping scoring",
+                            enriched.repo,
+                            enriched.number,
+                        )
 
                     await self._emit_event(
                         event_queue,

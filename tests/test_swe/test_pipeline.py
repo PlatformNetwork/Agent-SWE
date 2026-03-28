@@ -443,7 +443,7 @@ class TestDifficultyClassifierIntegration:
 
     @pytest.mark.asyncio
     async def test_difficulty_classifier_fallback(self, mock_gh_client):
-        """Verify heuristics used when llm_client=None."""
+        """Verify NO HARDCODED HEURISTICS when llm_client=None."""
         from swe_forge.swe.enricher import EnrichedPullRequest
 
         config = SwePipelineConfig()
@@ -470,8 +470,10 @@ class TestDifficultyClassifierIntegration:
 
         result = await pipeline._preclassify_stage(enriched, semaphore, metrics)
 
-        assert result == "easy"
-        assert metrics.preclassify_easy == 1
+        # NO HARDCODED HEURISTICS - returns None when no classifier
+        assert result is None
+        # No classification happened
+        assert metrics.preclassify_easy == 0
 
     @pytest.mark.asyncio
     async def test_difficulty_classifier_score_mapping(self, mock_gh_client):
