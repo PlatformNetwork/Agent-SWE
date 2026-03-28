@@ -74,3 +74,8 @@ hf-tasks/
 # OS
 .DS_Store
 Thumbs.db
+
+# Mining outputs
+tasks/
+tasks-*/
+*.jsonl
