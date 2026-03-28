@@ -25,6 +25,7 @@ from rich.progress import (
 )
 
 from swe_forge.export.jsonl import export_jsonl
+from swe_forge.llm.openrouter import OpenRouterClient
 from swe_forge.swe.github_api import GitHubClient
 from swe_forge.swe.gharchive import GhArchiveClient
 from swe_forge.swe.models import SweTask
@@ -34,6 +35,7 @@ from swe_forge.swe.pipeline import (
     SwePipelineConfig,
     SwePipelineEventType,
 )
+from swe_forge.swe.test_generator import TestGenerator
 from swe_forge.swe.concurrency import set_docker_containers_limit
 
 logger = logging.getLogger(__name__)
@@ -278,7 +280,7 @@ def mine(
 
     # Run the pipeline
     try:
-        result = asyncio.run(_run_pipeline(github_token, config, repo, verbose))
+        result = asyncio.run(_run_pipeline(github_token, config, repo, verbose, model))
 
         if result.tasks:
             # Export results
@@ -417,6 +419,7 @@ async def _run_pipeline(
     config: SwePipelineConfig,
     repo_filter: Optional[str],
     verbose: bool,
+    model: str = "moonshotai/kimi-k2.5",
 ):
     """Run the SWE pipeline with progress tracking."""
     from dataclasses import dataclass, field
@@ -425,6 +428,15 @@ async def _run_pipeline(
     class PipelineResult:
         tasks: list = field(default_factory=list)
         benchmark_metrics: object = None
+
+    # Create LLM client and TestGenerator for test generation
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    llm_client = None
+    test_generator = None
+    if openrouter_key:
+        llm_client = OpenRouterClient(api_key=openrouter_key, default_model=model)
+        test_generator = TestGenerator(llm=llm_client, model=model)
+        config.test_generator = test_generator
 
     async with GitHubClient(token=token) as gh_client:
         gh_archive_client = GhArchiveClient(token=token) if not repo_filter else None
@@ -577,7 +589,6 @@ async def _run_complete_mining(
 ):
     """Run the complete mining pipeline."""
     from swe_forge.pipeline import CompleteMiningPipeline
-    from swe_forge.llm.openrouter import OpenRouterClient
 
     llm_client = None
     if openrouter_key:

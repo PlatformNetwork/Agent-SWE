@@ -130,14 +130,14 @@ def sample_enriched_pr() -> EnrichedPullRequest:
 def _bind_mock_sandbox(pipeline: SwePipeline, mock_sandbox: MockSandbox):
     """Bind mock sandbox to pipeline's _create_sandbox.
 
-    The source code calls _create_sandbox without await, so we bind a
-    sync function that returns the mock directly (not a coroutine).
+    The source code calls _create_sandbox with await, so we bind an
+    async function that returns the mock.
     """
 
-    def create_sandbox_sync(self, repo_url: str, base_commit: str):
+    async def create_sandbox_async(self, repo_url: str, base_commit: str):
         return mock_sandbox
 
-    pipeline._create_sandbox = create_sandbox_sync.__get__(pipeline, type(pipeline))
+    pipeline._create_sandbox = create_sandbox_async.__get__(pipeline, type(pipeline))
 
 
 class TestGeneratorCalledWhenConfigured:

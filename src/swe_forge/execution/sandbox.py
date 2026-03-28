@@ -119,6 +119,7 @@ class DockerSandbox:
         self._state = SandboxState()
         self._manager: ContainerManager | None = None
         self._semaphore_acquired: bool = False
+        self._client_own_connection: bool = False
 
     @classmethod
     def from_spec(
@@ -159,6 +160,13 @@ class DockerSandbox:
         await sem.acquire()
         self._semaphore_acquired = True
 
+        # Enter DockerClient's async context if not already entered
+        if self._client._docker is None:
+            await self._client.__aenter__()
+            self._client_own_connection = True
+        else:
+            self._client_own_connection = False
+
         spec = ContainerSpec(
             name=self._container_name,
             image=self._config.image,
@@ -179,6 +187,8 @@ class DockerSandbox:
             self._manager = None
             sem.release()
             self._semaphore_acquired = False
+            if self._client_own_connection:
+                await self._client.__aexit__(None, None, None)
             raise
 
         logger.info(
@@ -201,6 +211,9 @@ class DockerSandbox:
             await self._manager.__aexit__(exc_type, exc_val, exc_tb)
             self._manager = None
             self._state.container_id = None
+
+        if self._client_own_connection:
+            await self._client.__aexit__(exc_type, exc_val, exc_tb)
 
         if self._semaphore_acquired:
             get_docker_semaphore().release()

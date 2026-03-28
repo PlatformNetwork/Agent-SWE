@@ -458,7 +458,7 @@ class SwePipeline:
         sandbox: DockerSandbox | None = None
 
         try:
-            sandbox = self._create_sandbox(repo_url, enriched.base_commit)
+            sandbox = await self._create_sandbox(repo_url, enriched.base_commit)
 
             async with sandbox:
                 await sandbox.setup_workspace(repo_url, enriched.base_commit)
