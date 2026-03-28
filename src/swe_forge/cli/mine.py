@@ -328,7 +328,9 @@ async def _run_pipeline(
                         if task and isinstance(task, SweTask):
                             tasks.append(task)
                             progress.update(
-                                task_id, advance=1, description=f"Mined {len(tasks)} tasks"
+                                task_id,
+                                advance=1,
+                                description=f"Mined {len(tasks)} tasks",
                             )
 
                     elif event.event_type == SwePipelineEventType.PIPELINE_COMPLETED:

@@ -281,7 +281,9 @@ async def _mine_tasks(
                         if task and isinstance(task, SweTask):
                             tasks.append(task)
                             progress.update(
-                                task_id, advance=1, description=f"Mined {len(tasks)} tasks"
+                                task_id,
+                                advance=1,
+                                description=f"Mined {len(tasks)} tasks",
                             )
 
                         if len(tasks) >= num_tasks:
