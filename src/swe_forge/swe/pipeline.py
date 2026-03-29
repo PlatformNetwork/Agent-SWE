@@ -659,6 +659,9 @@ class SwePipeline:
         self, difficulty: str | None, config: SwePipelineConfig
     ) -> bool:
         """Check if difficulty matches the configured filter."""
+        # Allow None (unclassified) to pass - will be processed anyway
+        if difficulty is None:
+            return True
         if config.difficulty_targets is not None:
             return difficulty in config.difficulty_targets.targets
         if config.difficulty_filter is not None:
@@ -856,28 +859,30 @@ class SwePipeline:
             if task is None:
                 return None
 
+            # Return task regardless of quality_passed (for data collection)
+            # Quality filtering can be done externally on the JSONL
             if task.quality_passed:
-                # Update task status
                 task.status = SweTaskStatus.READY
                 metrics.accepted_count += 1
+            else:
+                task.status = SweTaskStatus.REJECTED
+                metrics.quality_failed += 1
 
-                # Track language
-                if task.language:
-                    metrics.languages[task.language] = (
-                        metrics.languages.get(task.language, 0) + 1
-                    )
+            # Track language
+            if task.language:
+                metrics.languages[task.language] = (
+                    metrics.languages.get(task.language, 0) + 1
+                )
 
-                # Track per-difficulty
-                if difficulty:
-                    per_difficulty_counts[difficulty] = (
-                        per_difficulty_counts.get(difficulty, 0) + 1
-                    )
+            # Track per-difficulty
+            if difficulty:
+                per_difficulty_counts[difficulty] = (
+                    per_difficulty_counts.get(difficulty, 0) + 1
+                )
 
-                completed_count += 1
+            completed_count += 1
 
-                return task
-
-            return None
+            return task
 
         # Run all events concurrently (semaphores control actual concurrency)
         for event in events:
