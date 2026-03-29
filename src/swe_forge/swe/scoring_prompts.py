@@ -31,9 +31,8 @@ Acceptance criteria:
 - Tests pass: pytest tests/test_auth.py -v
 """,
         "reasoning": "Clear description, provides file location, expected behavior, "
-                     "reproduction code, and acceptance criteria."
+        "reproduction code, and acceptance criteria.",
     },
-    
     "good": {
         "score": 0.75,
         "prompt": """The login function crashes with special characters in tokens.
@@ -41,22 +40,20 @@ Acceptance criteria:
 Fix the token validation in the auth module (src/auth/).
 
 Users report getting 500 errors when logging in with non-ASCII usernames.""",
-        "reasoning": "Clear description but lacks reproduction code and specific file location."
+        "reasoning": "Clear description but lacks reproduction code and specific file location.",
     },
-    
     "acceptable": {
         "score": 0.55,
         "prompt": """Fix the auth bug in the login system.
 
 See PR description for details.""",
-        "reasoning": "Vague - requires developer to investigate what the bug is."
+        "reasoning": "Vague - requires developer to investigate what the bug is.",
     },
-    
     "poor": {
         "score": 0.25,
         "prompt": """Fix authentication.""",
-        "reasoning": "No details, no context, cannot determine what needs fixing."
-    }
+        "reasoning": "No details, no context, cannot determine what needs fixing.",
+    },
 }
 
 
@@ -73,7 +70,6 @@ DIFFICULTY_EXAMPLES = {
 
 Reasoning: Single file, minimal lines, cosmetic change.""",
     },
-    
     "easy_medium": {
         "score": 0.35,
         "level": "easy",
@@ -83,7 +79,6 @@ Reasoning: Single file, minimal lines, cosmetic change.""",
 
 Reasoning: Small change, straightforward addition, tests included.""",
     },
-    
     "medium": {
         "score": 0.50,
         "level": "medium",
@@ -94,7 +89,6 @@ Reasoning: Small change, straightforward addition, tests included.""",
 
 Reasoning: Multiple files, moderate complexity, cross-component change.""",
     },
-    
     "medium_hard": {
         "score": 0.65,
         "level": "medium",
@@ -106,7 +100,6 @@ Reasoning: Multiple files, moderate complexity, cross-component change.""",
 
 Reasoning: Cross-module refactoring with multiple components.""",
     },
-    
     "hard": {
         "score": 0.80,
         "level": "hard",
@@ -119,7 +112,6 @@ Reasoning: Cross-module refactoring with multiple components.""",
 
 Reasoning: Large change, database schema update, multiple components.""",
     },
-    
     "very_hard": {
         "score": 0.95,
         "level": "hard",
@@ -130,7 +122,7 @@ Reasoning: Large change, database schema update, multiple components.""",
 - Security implications
 
 Reasoning: Very large change, breaking changes, high complexity, security-critical.""",
-    }
+    },
 }
 
 
@@ -149,9 +141,8 @@ TEST_COVERAGE_EXAMPLES = {
 PASS_TO_PASS:
 - pytest tests/test_auth.py::test_valid_ascii_token -v
 - pytest tests/test_auth.py::test_token_refresh -v""",
-        "reasoning": "5 tests covering happy path, edge cases, errors, and regression."
+        "reasoning": "5 tests covering happy path, edge cases, errors, and regression.",
     },
-    
     "good": {
         "score": 0.75,
         "tests": """FAIL_TO_PASS:
@@ -159,21 +150,19 @@ PASS_TO_PASS:
 
 PASS_TO_PASS:
 - pytest tests/test_auth.py::test_valid_token -v""",
-        "reasoning": "2 tests covering main functionality, missing edge cases."
+        "reasoning": "2 tests covering main functionality, missing edge cases.",
     },
-    
     "acceptable": {
         "score": 0.55,
         "tests": """FAIL_TO_PASS:
 - pytest tests/ -v""",
-        "reasoning": "Single test command, generic, may miss edge cases."
+        "reasoning": "Single test command, generic, may miss edge cases.",
     },
-    
     "poor": {
         "score": 0.20,
         "tests": """No tests specified.""",
-        "reasoning": "Cannot verify the fix without tests."
-    }
+        "reasoning": "Cannot verify the fix without tests.",
+    },
 }
 
 
@@ -223,11 +212,9 @@ SCORING_THRESHOLDS = {
     "min_prompt_quality": 0.50,
     "min_test_coverage": 0.50,
     "min_overall_score": 0.50,
-    
     # Difficulty classification
     "easy_max_lines": 10,
     "medium_max_lines": 30,
-    
     # Multi-file complexity
     "multi_file_threshold": 2,
     "multi_file_boost": 0.15,
