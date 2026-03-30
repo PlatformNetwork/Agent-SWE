@@ -556,29 +556,41 @@ class TestGenerator:
 
     def _build_user_message(self, task: SweTask) -> str:
         """Build the initial user message for the agent."""
-        # Get language-specific test commands
-        build_cmds, test_cmds = self._test_commands_for_language(task.language)
-
         return f"""Repository: {task.repo}
 Language: {task.language}
 PR description: {self._truncate(task.prompt, 1000)}
-
-Suggested build: {" && ".join(build_cmds)}
-Suggested test: {" && ".join(test_cmds)}
 
 Diff (truncated):
 ```
 {self._truncate(task.patch, 4000)}
 ```
 
-The repo is cloned at /repo. Explore it, write behavioral tests, then submit.
+== WORKFLOW (FOLLOW EXACTLY) ==
 
-REMEMBER:
-- Your fail_to_pass tests will be verified against the PR patch.
-  They MUST pass once the patch is applied, or they will be rejected.
-- Do NOT read source files and assert on their content. Test runtime behavior only.
-- Include pass_to_pass tests from existing test suites adjacent to the changed code.
-- Test edge cases and use DIFFERENT inputs than those in the diff (anti-hardcoding)."""
+Step 1: Install dependencies
+- Run: apt-get update && apt-get install -y python3 python3-pip git
+- Check pyproject.toml/setup.py for install commands
+- Run install commands via `shell`
+
+Step 2: Explore the changed code
+- Use `read_file` to read the files mentioned in the diff
+- Use `list_dir` to understand project structure
+
+Step 3: WRITE TEST FILES (DO THIS NOW!)
+- Use `write_file` to create test_swe_<feature>.py
+- Write behavioral tests that EXERCISE the changed functionality
+
+Step 4: Run tests to validate
+- Use `shell` to run: pytest -c /dev/null test_swe_<feature>.py -v
+
+Step 5: SUBMIT (MUST CALL THIS!)
+- Call `submit_tests` with your test files and install commands
+
+== CRITICAL REMINDERS ==
+- Do NOT just explore forever - WRITE TEST FILES using `write_file`
+- Do NOT end without calling `submit_tests`
+- Tests MUST be behavioral (import, call functions, check values)
+- Do NOT read source and assert on file content."""
 
     def _test_commands_for_language(self, language: str) -> tuple[list[str], list[str]]:
         """Get suggested build and test commands for a language.
