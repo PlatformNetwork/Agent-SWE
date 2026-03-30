@@ -21,6 +21,36 @@ def _extract_test_file_names(test_patch: str) -> list[str]:
     return [Path(m).name for m in matches]
 
 
+def _make_natural_prompt(original_prompt: str, repo: str) -> str:
+    """Transform technical PR description into natural user prompt.
+    
+    Args:
+        original_prompt: Original PR title/description
+        repo: Repository name
+        
+    Returns:
+        Natural prompt like a real user would write
+    """
+    # Clean up the prompt
+    prompt = original_prompt.strip()
+    
+    # Remove common prefixes
+    for prefix in ["fix:", "feat:", "refactor:", "chore:", "docs:", "style:", "test:"]:
+        if prompt.lower().startswith(prefix):
+            prompt = prompt[len(prefix):].strip()
+            break
+    
+    # Truncate if too long
+    if len(prompt) > 150:
+        prompt = prompt[:147] + "..."
+    
+    # Create natural prompt
+    if prompt:
+        return f"Can you add tests for: {prompt}"
+    else:
+        return f"Can you add tests for the changes in {repo}?"
+
+
 def export_task_to_workspace(
     task: SweTask,
     output_folder: Path | str,
@@ -76,7 +106,7 @@ def export_task_to_workspace(
         },
         "language": task.language,
         "difficulty_score": task.difficulty_score,
-        "prompt": task.prompt,
+        "prompt": _make_natural_prompt(task.prompt, task.repo),
         "environment": {
             "image": docker_image or "ubuntu:24.04",
             "language_version": (
