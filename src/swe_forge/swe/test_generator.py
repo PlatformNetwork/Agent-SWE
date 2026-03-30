@@ -49,10 +49,12 @@ DEFAULT_TIMEOUT_MS = 60_000
 # System Prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Analyze the GitHub PR and write verification tests.
+SYSTEM_PROMPT = """Write tests for this PR.
 
-First, describe what the PR does using set_dataset_prompt.
-Then explore the repo, install dependencies, write tests, and submit."""
+1. Call set_dataset_prompt with a short description (5-10 words)
+2. Explore and install dependencies  
+3. Write tests
+4. Submit"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -486,11 +488,11 @@ class TestGenerator:
 
     def _build_user_message(self, task: SweTask) -> str:
         """Build the initial user message for the agent."""
-        return f"""PR in {task.repo}:
+        return f"""{task.repo}
 
 {self._truncate(task.patch, 4000)}
 
-Describe what this PR does, then write tests."""
+Use set_dataset_prompt first, then write tests."""
 
     def _test_commands_for_language(self, language: str) -> tuple[list[str], list[str]]:
         """Get suggested build and test commands for a language.
