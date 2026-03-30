@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Protocol
@@ -41,6 +42,9 @@ logger = getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 MAX_AGENT_TURNS = 400
+
+# ContextVar for per-async-task dataset_prompt isolation
+_dataset_prompt_var: ContextVar[str] = ContextVar("dataset_prompt", default="")
 MAX_VALIDATION_RETRIES = 3
 DEFAULT_TIMEOUT_MS = 60_000
 
@@ -458,7 +462,6 @@ class TestGenerator:
         self._max_tokens = max_tokens
         self._max_context_tokens = max_context_tokens
         self._written_files: list[TestFile] = []
-        self._dataset_prompt: str = ""  # LLM-generated dataset description
 
     def _get_tools(self) -> list[ToolDefinition]:
         """Get all tool schemas for the agent."""
@@ -674,7 +677,7 @@ Use set_dataset_prompt first, then write tests."""
         elif tool_name == "set_dataset_prompt":
             prompt = arguments.get("prompt", "")
             if prompt:
-                self._dataset_prompt = prompt
+                _dataset_prompt_var.set(prompt)
                 logger.info(f"Dataset prompt set: {prompt[:100]}")
                 return ToolResult(content=f"Dataset prompt set: {prompt[:100]}")
             return ToolResult(content="Error: missing prompt", is_error=True)
@@ -744,6 +747,7 @@ Use set_dataset_prompt first, then write tests."""
             max_context_tokens=self._max_context_tokens,
         )
         self._written_files = []
+        _dataset_prompt_var.set("")  # Reset for each async task
         validation_retries = 0
 
         tools = self._get_tools()
@@ -829,7 +833,7 @@ Use set_dataset_prompt first, then write tests."""
         # Exhausted turns without success
         return GeneratedTests(
             turn_count=loop.turn_count,
-            dataset_prompt=self._dataset_prompt,
+            dataset_prompt=_dataset_prompt_var.get(),
             success=False,
         )
 
@@ -887,7 +891,7 @@ Use set_dataset_prompt first, then write tests."""
             pass_to_pass=submit.pass_to_pass,
             test_files=submit.test_files,
             install_commands=submit.install_commands,
-            dataset_prompt=self._dataset_prompt,
+            dataset_prompt=_dataset_prompt_var.get(),
             turn_count=turn_count,
             success=success,
         )
