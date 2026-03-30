@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 from swe_forge.exceptions import DiscoveryError
+from swe_forge.export.docker_verify import generate_run_script
 from swe_forge.swe.models import SweTask
 
 logger = getLogger(__name__)
@@ -132,6 +133,12 @@ def export_task_to_workspace(
         tests_dir.mkdir(exist_ok=True)
         _extract_test_files(task.test_patch, tests_dir)
 
+    # Generate run_tests.sh script for easy Docker verification
+    try:
+        generate_run_script(task_dir)
+    except Exception as e:
+        logger.warning(f"Could not generate run script: {e}")
+
     return task_dir
 
 
@@ -185,18 +192,54 @@ def _extract_test_files(test_patch: str, tests_dir: Path) -> None:
     """Extract test files from test_patch.
 
     Handles multiple formats:
-    1. Git diff format (diff --git ... +lines)
-    2. "# Test file: path" format (from TestGenerator)
-    3. Legacy "# file.py" format
+    1. "# Test file: path" format (from TestGenerator) - PRIMARY
+    2. Git diff format (diff --git ... +lines)
+    3. Truncate long filenames to avoid filesystem errors
     """
     tests_dir.mkdir(parents=True, exist_ok=True)
 
-    # Format 1: Git diff format
+    def safe_filename(name: str, max_len: int = 200) -> str:
+        """Create safe filename, truncating if too long."""
+        # Remove invalid characters
+        safe = re.sub(r'[<>:"/\\|?*]', '_', name)
+        # Truncate to max length
+        if len(safe) > max_len:
+            safe = safe[:max_len]
+        return safe
+
+    # Format 1: "# Test file: path" - Split by markers
+    if "# Test file:" in test_patch or "#Test file:" in test_patch:
+        parts = re.split(r"#\s*Test file:\s*", test_patch)
+        for part in parts:
+            if not part.strip():
+                continue
+            # First line is filename, rest is content
+            lines = part.split("\n", 1)
+            filename = lines[0].strip()
+            content = lines[1] if len(lines) > 1 else ""
+            
+            if not filename or not content.strip():
+                continue
+            
+            # Use safe filename
+            safe_name = safe_filename(filename)
+            if not safe_name.endswith(".py"):
+                safe_name += ".py"
+            
+            test_file = tests_dir / safe_name
+            try:
+                with open(test_file, "w", encoding="utf-8") as f:
+                    f.write(content.strip() + "\n")
+                logger.debug(f"Extracted test file: {test_file}")
+            except OSError as e:
+                logger.warning(f"Could not write test file {safe_name}: {e}")
+        return
+
+    # Format 2: Git diff format
     if "diff --git" in test_patch:
         diffs = test_patch.split("diff --git")
-
         for diff in diffs[1:]:
-            plus_match = re.search(r"\+\+\+ b/(.+)", diff)
+            plus_match = re.search(r"\+\+\+ b/(.+?)(?:\n|$)", diff)
             if not plus_match:
                 continue
             file_path = plus_match.group(1).strip()
@@ -220,39 +263,23 @@ def _extract_test_files(test_patch: str, tests_dir: Path) -> None:
             if content_lines:
                 while content_lines and not content_lines[-1].strip():
                     content_lines.pop()
-
-                test_file = tests_dir / Path(file_path).name
-                with open(test_file, "w", encoding="utf-8") as f:
-                    f.write("\n".join(content_lines))
-                    if content_lines:
-                        f.write("\n")
+                
+                safe_name = safe_filename(Path(file_path).name)
+                test_file = tests_dir / safe_name
+                try:
+                    with open(test_file, "w", encoding="utf-8") as f:
+                        f.write("\n".join(content_lines))
+                        if content_lines:
+                            f.write("\n")
+                except OSError as e:
+                    logger.warning(f"Could not write test file {safe_name}: {e}")
         return
 
-    # Format 2: "# Test file: path"
-    pattern2 = r"#\s*Test file:\s*(.+)\n(.+?)(?=#\s*Test file:|$)"
-    matches2 = re.findall(pattern2, test_patch, re.DOTALL)
-
-    if matches2:
-        for file_path, content in matches2:
-            file_path = file_path.strip()
-            if not file_path:
-                continue
-            test_file = tests_dir / Path(file_path).name
-            with open(test_file, "w", encoding="utf-8") as f:
-                f.write(content.strip() + "\n")
-        return
-
-    # Format 3: Legacy "# file.py" format
-    pattern3 = r"#\s*(.+\.py)\n(.+?)(?=#\s*.+\.py\n|$)"
-    matches3 = re.findall(pattern3, test_patch, re.DOTALL)
-
-    for file_path, content in matches3:
-        file_path = file_path.strip()
-        if not file_path:
-            continue
-        test_file = tests_dir / Path(file_path).name
+    # Fallback: Write entire test_patch as test_swe_generated.py
+    if test_patch.strip():
+        test_file = tests_dir / "test_swe_generated.py"
         with open(test_file, "w", encoding="utf-8") as f:
-            f.write(content.strip() + "\n")
+            f.write(test_patch)
 
 
 def update_workspace_with_prebuilt_image(
