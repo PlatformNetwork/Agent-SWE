@@ -34,8 +34,8 @@ def tasks_to_records(tasks_dir: Path) -> list[dict]:
             install_info = ws.get("install", {})
 
             record = {
-                "task_id": ws.get("task_id", task_dir.name),
-                "repo_url": repo_info.get("url", ""),
+                "instance_id": ws.get("task_id", task_dir.name),
+                "repo": repo_info.get("url", ""),
                 "base_commit": repo_info.get("base_commit", ""),
                 "merge_commit": repo_info.get("merge_commit", ""),
                 "language": ws.get("language", ""),
