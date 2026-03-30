@@ -24,7 +24,6 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from swe_forge.export.jsonl import export_jsonl
 from swe_forge.llm.openrouter import OpenRouterClient
 from swe_forge.swe.github_api import GitHubClient
 from swe_forge.swe.gharchive import GhArchiveClient
@@ -157,13 +156,13 @@ def mine(
         ),
     ] = 8,
     output_folder: Annotated[
-        Path | None,
+        Path,
         typer.Option(
             "--output-folder",
             "-O",
-            help="Output folder for workspace format export",
+            help="Output folder for workspace format export (REQUIRED)",
         ),
-    ] = None,
+    ] = Path("./tasks"),
     docker_username: Annotated[
         str | None,
         typer.Option(
@@ -231,10 +230,8 @@ def mine(
         )
         raise typer.Exit(code=1)
 
-    # Validate output directory
-    output_path = Path(output)
-    if output_path.parent != Path("."):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure output folder exists
+    output_folder.mkdir(parents=True, exist_ok=True)
 
     # Build pipeline config
     languages = (
@@ -287,19 +284,15 @@ def mine(
         result = asyncio.run(_run_pipeline(github_token, config, repo, verbose, model))
 
         if result.tasks:
-            # Export results
-            export_jsonl(result.tasks, output_path)
-            console.print(
-                f"\n[green]Exported {len(result.tasks)} tasks to {output}[/green]"
+            # Export to workspace format only
+            from swe_forge.export.workspace import export_tasks_to_workspace
+
+            export_tasks_to_workspace(
+                result.tasks, output_folder, docker_username=docker_username
             )
-
-            if output_folder:
-                from swe_forge.export.workspace import export_tasks_to_workspace
-
-                export_tasks_to_workspace(
-                    result.tasks, output_folder, docker_username=docker_username
-                )
-                console.print(f"[green]Workspace export: {output_folder}[/green]")
+            console.print(
+                f"\n[green]Exported {len(result.tasks)} tasks to {output_folder}[/green]"
+            )
 
             # Build Docker images if requested
             if build_docker and docker_username:
@@ -319,12 +312,11 @@ def mine(
                 )
 
                 # Update workspace exports with pre-built image info
-                if output_folder:
-                    for task, build_result in zip(result.tasks, build_results):
-                        if build_result.success and build_result.image_name:
-                            _update_workspace_docker(
-                                output_folder, task.id, build_result.image_name
-                            )
+                for task, build_result in zip(result.tasks, build_results):
+                    if build_result.success and build_result.image_name:
+                        _update_workspace_docker(
+                            output_folder, task.id, build_result.image_name
+                        )
 
             # Print summary
             if result.benchmark_metrics:
@@ -609,9 +601,13 @@ async def _run_complete_mining(
 
         if result:
             from pathlib import Path
-            from swe_forge.export.jsonl import export_jsonl
-
-            export_jsonl([result.task], Path(output), append=True)
+            from swe_forge.export.workspace import export_task_to_workspace
+            
+            # Export to workspace format
+            output_dir = Path(output).parent if Path(output).suffix else Path(output)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            export_task_to_workspace(result.task, output_dir)
+            console.print(f"[green]Exported to: {output_dir / result.task.id}[/green]")
 
         return result
 

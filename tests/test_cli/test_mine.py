@@ -181,11 +181,11 @@ class TestMineCommandValidation:
 class TestMineCommandIntegration:
     """Integration tests for mine command execution."""
 
-    def test_mine_creates_output_file(self, tmp_path):
-        """Test that mine command creates output file."""
+    def test_mine_creates_output_folder(self, tmp_path):
+        """Test that mine command creates workspace output folder."""
         from swe_forge.swe.models import SweTask
 
-        output_file = tmp_path / "output.jsonl"
+        output_folder = tmp_path / "tasks"
 
         with patch("swe_forge.cli.mine._run_pipeline") as mock_run:
             from dataclasses import dataclass, field
@@ -204,9 +204,12 @@ class TestMineCommandIntegration:
                 prompt="Test prompt",
             )
             mock_run.return_value = MockResult(tasks=[task], benchmark_metrics=None)
-            result = runner.invoke(mine_app, ["mine", "--output", str(output_file)])
+            result = runner.invoke(
+                mine_app, ["mine", "--output-folder", str(output_folder)]
+            )
             assert result.exit_code == 0
-            assert output_file.exists()
+            # Check that task directory was created
+            assert (output_folder / "test-1").exists()
 
     def test_verbose_mode(self):
         """Test that verbose mode works."""
