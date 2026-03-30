@@ -614,19 +614,11 @@ class AgenticLoop:
         self._messages.append(Message.system(content))
 
     def add_user(self, content: str) -> None:
-        """Add a user message and increment turn counter.
-
-        This represents a "turn" in the conversation where we're
-        giving new input to the model.
+        """Add a user message.
 
         Args:
             content: The user message content.
-
-        Raises:
-            RuntimeError: If the turn budget is exhausted.
         """
-        # Increment budget first (will raise if exhausted)
-        self._budget.increment()
         self._messages.append(Message.user(content))
 
     def add_assistant(self, content: str) -> None:
@@ -656,6 +648,20 @@ class AgenticLoop:
             content: The tool result content.
         """
         self._messages.append(Message.tool_result(call_id, content))
+
+    def increment_turn(self) -> int:
+        """Manually increment the turn counter after each LLM API call.
+
+        Use this after each LLM invocation to track turns correctly,
+        including when the LLM responds with tool calls.
+
+        Returns:
+            The new current turn value.
+
+        Raises:
+            RuntimeError: If the budget is already exhausted.
+        """
+        return self._budget.increment()
 
     def last_message(self) -> Message | None:
         """Get the last message in the conversation, if any.

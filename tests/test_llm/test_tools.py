@@ -368,20 +368,26 @@ class TestAgenticLoop:
         assert loop.messages[0].role == "system"
         assert loop.messages[0].content == "You are helpful."
 
-    def test_add_user_message_increments_turn(self):
+    def test_add_user_message(self):
         loop = AgenticLoop(max_turns=10)
         loop.add_user("Hello")
-        assert loop.turn_count == 1
         assert loop.message_count() == 1
         assert loop.messages[0].role == "user"
 
-    def test_add_user_message_raises_when_exhausted(self):
+    def test_increment_turn(self):
+        loop = AgenticLoop(max_turns=10)
+        loop.increment_turn()
+        assert loop.turn_count == 1
+        loop.increment_turn()
+        assert loop.turn_count == 2
+
+    def test_increment_turn_raises_when_exhausted(self):
         loop = AgenticLoop(max_turns=2)
-        loop.add_user("Hello")
-        loop.add_user("Hi")
+        loop.increment_turn()
+        loop.increment_turn()
         assert loop.is_exhausted() is True
         with pytest.raises(RuntimeError):
-            loop.add_user("Another message")
+            loop.increment_turn()
 
     def test_add_assistant_message(self):
         loop = AgenticLoop()
@@ -451,6 +457,7 @@ class TestAgenticLoop:
         loop.add_user("Hello")
         loop.add_assistant("Hi")
         assert loop.message_count() == 3
+        loop.increment_turn()
         assert loop.turn_count == 1
 
         loop.clear()
@@ -461,15 +468,15 @@ class TestAgenticLoop:
     def test_is_exhausted(self):
         loop = AgenticLoop(max_turns=2)
         assert loop.is_exhausted() is False
-        loop.add_user("Hello")
+        loop.increment_turn()
         assert loop.is_exhausted() is False
-        loop.add_user("Hi")
+        loop.increment_turn()
         assert loop.is_exhausted() is True
 
     def test_remaining_turns(self):
         loop = AgenticLoop(max_turns=10)
         assert loop.remaining_turns() == 10
-        loop.add_user("Hello")
+        loop.increment_turn()
         assert loop.remaining_turns() == 9
 
     def test_messages_read_only(self):
@@ -488,6 +495,7 @@ class TestAgenticLoop:
     def test_repr(self):
         loop = AgenticLoop(max_turns=10)
         loop.add_user("Hello")
+        loop.increment_turn()
         repr_str = repr(loop)
         assert "AgenticLoop" in repr_str
         assert "1/10" in repr_str
@@ -497,6 +505,7 @@ class TestAgenticLoop:
 
         loop.add_system("You are a test engineer.")
         loop.add_user("Write tests for this PR.")
+        loop.increment_turn()
 
         tool_call = ToolCall(
             id="call_1",
@@ -507,6 +516,7 @@ class TestAgenticLoop:
         loop.add_tool_result("call_1", "file1.py\nfile2.py")
 
         loop.add_user("Now check the test file.")
+        loop.increment_turn()
 
         assert loop.turn_count == 2
         assert loop.message_count() == 5

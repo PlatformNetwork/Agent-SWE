@@ -236,7 +236,10 @@ class OpenRouterClient(LLMClient):
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
         wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type(RateLimitError),
+        retry=(
+            retry_if_exception_type(RateLimitError)
+            | retry_if_exception_type(aiohttp.ClientError)
+        ),
         reraise=True,
     )
     async def complete(self, request: GenerationRequest) -> GenerationResponse:

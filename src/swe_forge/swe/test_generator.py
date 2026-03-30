@@ -845,6 +845,7 @@ REMEMBER:
 
             try:
                 response = await self._llm.complete(request)
+                loop.increment_turn()  # Count each LLM call as a turn
             except Exception as e:
                 logger.error(f"LLM generation failed: {e}")
                 break
@@ -919,40 +920,36 @@ REMEMBER:
 
         Returns None if valid, or an error message if invalid.
         """
-        # Check fail_to_pass
+        # Check fail_to_pass - ALWAYS required
         if not submit.fail_to_pass:
-            if retry_count < MAX_VALIDATION_RETRIES:
-                return (
-                    "fail_to_pass must contain at least one test command. "
-                    "Write a test that FAILS on the base commit and PASSES "
-                    "after the PR patch is applied."
-                )
+            return (
+                "fail_to_pass must contain at least one test command. "
+                "Write a test that FAILS on the base commit and PASSES "
+                "after the PR patch is applied."
+            )
 
-        # Check install_commands
+        # Check install_commands - ALWAYS required
         if not submit.install_commands:
-            if retry_count < MAX_VALIDATION_RETRIES:
-                return (
-                    "install_commands must contain at least one command. "
-                    "Run installation commands via shell first, verify they succeed "
-                    "(exit code 0), then include them in install_commands."
-                )
+            return (
+                "install_commands must contain at least one command. "
+                "Run installation commands via shell first, verify they succeed "
+                "(exit code 0), then include them in install_commands."
+            )
 
         # Check for string-matching tests
         rejection = reject_string_matching_tests(submit.test_files)
         if rejection:
-            if retry_count < MAX_VALIDATION_RETRIES:
-                return (
-                    f"{rejection}\n\n"
-                    "Rewrite your tests to check RUNTIME BEHAVIOR, not file contents. "
-                    "Import modules, call functions, check return values. "
-                    "Do NOT use open()/readFileSync() to read source and assert strings."
-                )
+            return (
+                f"{rejection}\n\n"
+                "Rewrite your tests to check RUNTIME BEHAVIOR, not file contents. "
+                "Import modules, call functions, check return values. "
+                "Do NOT use open()/readFileSync() to read source and assert strings."
+            )
 
         # Check test script validity
         script_issues = validate_test_scripts(submit.test_files)
         if script_issues:
-            if retry_count < MAX_VALIDATION_RETRIES:
-                return f"{script_issues}\n\nFix the issues and resubmit."
+            return f"{script_issues}\n\nFix the issues and resubmit."
 
         return None
 
