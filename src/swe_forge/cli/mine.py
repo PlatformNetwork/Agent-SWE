@@ -94,7 +94,7 @@ def mine(
             "-m",
             help="LLM model for classification",
         ),
-    ] = "moonshotai/kimi-k2.5",
+    ] = "openai/gpt-5.4",
     once: Annotated[
         bool,
         typer.Option(
@@ -602,7 +602,7 @@ async def _run_complete_mining(
         if result:
             from pathlib import Path
             from swe_forge.export.workspace import export_task_to_workspace
-            
+
             # Export to workspace format
             output_dir = Path(output).parent if Path(output).suffix else Path(output)
             output_dir.mkdir(parents=True, exist_ok=True)
