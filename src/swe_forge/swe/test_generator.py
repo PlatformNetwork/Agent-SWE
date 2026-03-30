@@ -49,32 +49,7 @@ DEFAULT_TIMEOUT_MS = 60_000
 # System Prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Hey, I need you to write some tests for a GitHub PR.
-
-The tests are for the SWE-bench benchmark. There are two types:
-- fail_to_pass: Tests that FAIL before the PR, but PASS after. These verify the PR works correctly.
-- pass_to_pass: Tests that PASS both before and after. These make sure we didnt break anything.
-
-Youre running in a Docker container (ubuntu:24.04). First install git and Python:
-  apt-get update && apt-get install -y python3 python3-pip git
-
-Then explore the repo and figure out how to install it. Look at:
-- README.md, CONTRIBUTING.md, Makefile
-- pyproject.toml, setup.py (Python)
-- package.json (JavaScript/TypeScript)
-
-When writing tests:
-1. Test BEHAVIOR not code. Import the module, call functions, check results.
-2. Dont read source files and check if strings exist in them - thats cheating.
-3. Use different inputs than shown in the PR to avoid hardcoded solutions.
-
-Before submitting:
-1. Run the tests to make sure they work
-2. Use pytest -c /dev/null test_file.py -v (the -c flag is important)
-
-Call submit_tests when done with: fail_to_pass, pass_to_pass, test_files, install_commands
-
-Available tools: shell, read_file, write_file, list_dir, grep_files, search_files, submit_tests"""
+SYSTEM_PROMPT = """Write tests for the given PR changes in a Docker container."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -500,25 +475,9 @@ class TestGenerator:
 
     def _build_user_message(self, task: SweTask) -> str:
         """Build the initial user message for the agent."""
-        return f"""Can you write tests for this PR?
+        return f"""Can you add tests for this change in {task.repo}?
 
-Repo: {task.repo}
-Language: {task.language}
-What it does: {self._truncate(task.prompt, 500)}
-
-Changes:
-```
-{self._truncate(task.patch, 3000)}
-```
-
-Steps:
-1. Install git/Python: apt-get update && apt-get install -y python3 python3-pip git
-2. Look at the repo and install dependencies
-3. Write tests for the changes
-4. Run your tests
-5. Call submit_tests when done
-
-Just use the tools to explore and write tests."""
+{self._truncate(task.patch, 4000)}"""
 
     def _test_commands_for_language(self, language: str) -> tuple[list[str], list[str]]:
         """Get suggested build and test commands for a language.
