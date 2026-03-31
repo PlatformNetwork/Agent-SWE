@@ -457,6 +457,145 @@ class SweTask:
 
 ---
 
+---
+
+## Testing Tasks
+
+### Test Tasks from HuggingFace Dataset
+
+The published dataset `CortexLM/swe-forge` on HuggingFace contains task instances with pre-built Docker images.
+
+#### Prerequisites
+
+- Docker installed and running
+- `pip install datasets`
+
+#### CLI Usage
+
+```bash
+# Test a specific task by ID
+python scripts/test_task.py --task-id pydantic-pydantic-12985
+
+# Test 5 random tasks
+python scripts/test_task.py --random 5
+
+# Test all tasks and save results
+python scripts/test_task.py --all --output results.json
+
+# With verbose output
+python scripts/test_task.py --task-id pydantic-pydantic-12985 -v
+```
+
+Or use the shell wrapper:
+
+```bash
+./scripts/test_task.sh --random 5
+```
+
+#### Docker Sandbox
+
+Each task is tested in an isolated Docker container:
+
+1. **Pull Docker image** - Contains repo at `base_commit`
+2. **Run fail_to_pass tests** - Should all PASS
+3. **Run pass_to_pass tests** - Should all PASS
+
+#### Docker Image Contents
+
+Pre-built Docker images (`platformnetwork/swe-forge:*`) contain:
+- `/workspace/patch.diff` - The patch
+- `/workspace/run_tests.sh` - Test script
+- Repository cloned at `base_commit`
+
+#### Dataset Fields
+
+| Field | Description |
+|-------|-------------|
+| `instance_id` | Task ID (format: `owner-repo-123`) |
+| `docker_image` | Pre-built Docker image |
+| `fail_to_pass` | Tests that must pass after patch |
+| `pass_to_pass` | Tests that must stay passing |
+| `patch` | Unified diff to apply |
+
+
+---
+
+## Benchmark Harness
+
+SWE-Forge provides a Docker-based evaluation harness for benchmarking model-generated patches, similar to SWE-bench.
+
+### Installation
+
+```bash
+pip install datasets  # For HuggingFace dataset loading
+```
+
+### Quick Start
+
+```bash
+# Evaluate gold patches (ground truth) on a specific task
+python3 scripts/run_evaluation.py --predictions_path gold --instance_ids pydantic-pydantic-12985
+
+# Evaluate on 5 random tasks
+python3 scripts/run_evaluation.py --predictions_path gold --random 5
+
+# Evaluate all tasks
+python3 scripts/run_evaluation.py --predictions_path gold --max_workers 8
+```
+
+### Prediction Format
+
+Create a JSONL file with model predictions:
+
+```json
+{"instance_id": "pydantic-pydantic-12985", "model_patch": "diff --git a/..."}
+{"instance_id": "owner-repo-123", "model_patch": "..."}
+```
+
+Then evaluate:
+
+```bash
+python3 scripts/run_evaluation.py --predictions_path predictions.jsonl --max_workers 4
+```
+
+### Evaluation Flow
+
+For each task, the harness:
+
+1. **Pull Docker image** - Contains repo at base commit
+2. **Run fail_to_pass tests BEFORE patch** - Should FAIL (bug exists)
+3. **Apply model patch**
+4. **Run fail_to_pass tests AFTER patch** - Should PASS (bug fixed)
+5. **Run pass_to_pass tests** - Should PASS (no regression)
+6. **Grade** - Resolved if all tests pass as expected
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `--predictions_path` | Path to JSONL or "gold" for ground truth |
+| `--max_workers` | Parallel workers (default: 4) |
+| `--instance_ids` | Specific instances to evaluate |
+| `--random N` | Evaluate N random instances |
+| `--timeout` | Timeout per instance (default: 600s) |
+| `--run_id` | Run identifier |
+| `--output_dir` | Output directory |
+| `--clean` | Cleanup Docker after evaluation |
+
+### Output
+
+Results are saved to `evaluation_results/{run_id}/`:
+
+- `results.json` - Overall metrics
+- `instance_results.jsonl` - Detailed per-instance results
+
+### Metrics
+
+- **Resolution Rate**: Percentage of patches that fixed the issue
+- **Tests Passed/Failed**: Test execution results
+- **Duration**: Evaluation time
+
+
 ## Credits
 
 Built on top of [SweInfinite](https://github.com/unconst/SweInfinite) by [@unconst](https://github.com/unconst).
@@ -474,3 +613,135 @@ Extended with:
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+---
+
+## Quality Control Pipeline
+
+SWE-Forge includes a comprehensive quality control pipeline to ensure tasks are valid and appropriately challenging.
+
+### Overview
+
+```
+Task Generation
+      ↓
+┌─────────────────────────────────┐
+│ 1. Complexity Evaluation       │
+│    LLM assesses task difficulty │
+│    Score: 0.0 (trivial) to 1.0  │
+│    Reject if < 0.25             │
+└─────────────────────────────────┘
+      ↓
+┌─────────────────────────────────┐
+│ 2. Docker Verification         │
+│    Tests FAIL before patch     │
+│    Apply patch                 │
+│    Tests PASS after patch     │
+│    Reject if tests don't work  │
+└─────────────────────────────────┘
+      ↓
+   Accept Task
+```
+
+### Complexity Scoring
+
+The complexity evaluator uses an LLM agent to analyze:
+
+| Factor | Impact |
+|--------|--------|
+| Lines changed | More lines → higher score |
+| Files modified | More files → higher score |
+| Logic complexity | Complex logic → higher score |
+| Context needed | More context → higher score |
+| Change type | Config/docs → lower score |
+
+**Scoring thresholds:**
+
+| Score | Difficulty | Action |
+|-------|------------|--------|
+| 0.0-0.25 | Trivial | ❌ **REJECTED** |
+| 0.25-0.40 | Easy | ✅ Accepted |
+| 0.40-0.65 | Medium | ✅ Accepted |
+| 0.65-1.00 | Hard | ✅ Accepted |
+
+### Docker Verification
+
+Each task is verified in an isolated Docker container:
+
+1. **Before patch**: Tests MUST FAIL (proves bug exists)
+2. **Apply patch**: `git apply /workspace/patch.diff`
+3. **After patch**: Tests MUST PASS (proves fix works)
+4. **Regression tests**: `pass_to_pass` tests must stay passing
+
+### CLI Options
+
+```bash
+# Mining with quality control (default)
+swe-forge mine mine --limit 100
+
+# Adjust minimum complexity
+swe-forge mine mine --min-complexity 0.30
+
+# Skip Docker verification (faster, less reliable)
+swe-forge mine mine --no-verify
+
+# Skip complexity check (faster, accepts trivial tasks)
+swe-forge mine mine --skip-complexity
+
+# Use different model for evaluation
+swe-forge mine mine --complexity-model openai/gpt-4
+```
+
+### Revalidation Script
+
+Revalidate existing tasks to filter out invalid ones:
+
+```bash
+# Revalidate all tasks
+python scripts/revalidate_tasks.py --tasks-dir ./tasks
+
+# Skip Docker verification (complexity only)
+python scripts/revalidate_tasks.py --tasks-dir ./tasks --no-verification
+
+# Limit to N tasks
+python scripts/revalidate_tasks.py --tasks-dir ./tasks --limit 10
+
+# Custom threshold
+python scripts/revalidate_tasks.py --tasks-dir ./tasks --min-complexity 0.30
+
+# Output report
+python scripts/revalidate_tasks.py --tasks-dir ./tasks --report report.json
+```
+
+### Expected Results
+
+For a typical mining run:
+
+| Metric | Typical Value |
+|--------|---------------|
+| Tasks generated | 100% |
+| Rejected (complexity) | ~20% |
+| Rejected (verification) | ~20% |
+| **Accepted** | **~60%** |
+
+The acceptance rate of 30-70% is normal and ensures quality benchmarks.
+
+### Dataset Fields
+
+When tasks are exported to HuggingFace, quality fields are included:
+
+| Field | Description |
+|-------|-------------|
+| `complexity_score` | 0.0-1.0 complexity rating |
+| `complexity_difficulty` | "easy", "medium", or "hard" |
+| `verified` | True if Docker verification passed |
+
+Filter on HF:
+```python
+from datasets import load_dataset
+
+ds = load_dataset("CortexLM/swe-forge")
+# Only medium+ difficulty, verified tasks
+filtered = ds.filter(lambda x: x['complexity_score'] >= 0.4 and x['verified'])
+```

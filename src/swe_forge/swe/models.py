@@ -107,9 +107,28 @@ class SweTask(BaseModel):
     prompt: str = ""
     dataset_prompt: str = ""
     original_pr_body: str = ""
+    
+    # Quality control fields
     quality_score: float | None = None
     quality_passed: bool = False
     docker_passed: bool = False
+    
+    # Complexity evaluation fields
+    complexity_score: float = Field(
+        default=0.0, 
+        ge=0.0, 
+        le=1.0,
+        description="Complexity score from 0.0 (trivial) to 1.0 (very complex)"
+    )
+    complexity_difficulty: str = Field(
+        default="",
+        description="Difficulty category: easy, medium, or hard"
+    )
+    verified: bool = Field(
+        default=False,
+        description="Whether Docker verification passed"
+    )
+    
     workspace_path: str | None = None
     status: SweTaskStatus = SweTaskStatus.CANDIDATE
 
@@ -136,3 +155,18 @@ class SweTask(BaseModel):
 
     def has_tests(self) -> bool:
         return bool(self.fail_to_pass or self.pass_to_pass)
+    
+    def is_quality_acceptable(self, min_complexity: float = 0.25) -> bool:
+        """Check if task meets quality thresholds.
+        
+        Args:
+            min_complexity: Minimum complexity score to accept
+            
+        Returns:
+            True if task passes all quality checks
+        """
+        if self.complexity_score < min_complexity:
+            return False
+        if not self.verified:
+            return False
+        return True
