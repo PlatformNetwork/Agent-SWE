@@ -261,12 +261,17 @@ class MockExecResult:
 
 
 class MockSandbox:
-    def __init__(self):
+    def __init__(self, *, test_exit_code: int = 1):
         self.files: dict[str, str] = {}
         self.commands: list[tuple[str, float | None]] = []
+        self.test_exit_code = test_exit_code
 
     async def run_command(self, cmd: str, *, timeout: float | None = None):
         self.commands.append((cmd, timeout))
+        if "pytest" in cmd or "npm test" in cmd or "cargo test" in cmd:
+            return MockExecResult(
+                stdout="output", stderr="", exit_code=self.test_exit_code
+            )
         return MockExecResult(stdout="output", stderr="", exit_code=0)
 
     async def write_file(self, path: str, content: str):
@@ -655,3 +660,150 @@ class TestConstants:
 
     def test_max_validation_retries(self):
         assert MAX_VALIDATION_RETRIES == 3
+
+
+class TestPreApplyValidation:
+    """Tests for pre-apply validation in _validate_pre_apply."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_tests_that_pass_on_base(self):
+        """Tests that PASS on base commit should be rejected."""
+        task = SweTask(
+            id="test-preapply-1",
+            repo="owner/repo",
+            base_commit="abc123",
+            language="python",
+            prompt="Test",
+        )
+
+        submit_tool_call = ToolCall(
+            id="call_submit",
+            type="function",
+            function=FunctionCall(
+                name="submit_tests",
+                arguments='{"fail_to_pass": ["pytest test.py"], "pass_to_pass": [], "test_files": [], "install_commands": ["pip install -e ."]}',
+            ),
+        )
+
+        responses = [
+            create_response_with_tool_calls([submit_tool_call]),
+        ]
+
+        mock_llm = MockLLMClient(responses)
+        mock_sandbox = MockSandbox(test_exit_code=0)
+
+        generator = TestGenerator(mock_llm, max_turns=10)
+        result = await generator.generate_tests(task, mock_sandbox)
+
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_accepts_tests_that_fail_on_base(self):
+        """Tests that FAIL on base commit should be accepted."""
+        task = SweTask(
+            id="test-preapply-2",
+            repo="owner/repo",
+            base_commit="abc123",
+            language="python",
+            prompt="Test",
+        )
+
+        submit_tool_call = ToolCall(
+            id="call_submit",
+            type="function",
+            function=FunctionCall(
+                name="submit_tests",
+                arguments='{"fail_to_pass": ["pytest test.py"], "pass_to_pass": [], "test_files": [], "install_commands": ["pip install -e ."]}',
+            ),
+        )
+
+        responses = [
+            create_response_with_tool_calls([submit_tool_call]),
+        ]
+
+        mock_llm = MockLLMClient(responses)
+        mock_sandbox = MockSandbox(test_exit_code=1)
+
+        generator = TestGenerator(mock_llm, max_turns=10)
+        result = await generator.generate_tests(task, mock_sandbox)
+
+        assert result.success is True
+        assert result.fail_to_pass == ["pytest test.py"]
+
+    @pytest.mark.asyncio
+    async def test_validates_each_fail_to_pass_test(self):
+        """Each fail_to_pass test should be validated."""
+        task = SweTask(
+            id="test-preapply-3",
+            repo="owner/repo",
+            base_commit="abc123",
+            language="python",
+            prompt="Test",
+        )
+
+        submit_tool_call = ToolCall(
+            id="call_submit",
+            type="function",
+            function=FunctionCall(
+                name="submit_tests",
+                arguments='{"fail_to_pass": ["pytest test_a.py", "pytest test_b.py"], "pass_to_pass": [], "test_files": [], "install_commands": ["pip install"]}',
+            ),
+        )
+
+        responses = [
+            create_response_with_tool_calls([submit_tool_call]),
+        ]
+
+        mock_llm = MockLLMClient(responses)
+        mock_sandbox = MockSandbox(test_exit_code=1)
+
+        generator = TestGenerator(mock_llm, max_turns=10)
+        result = await generator.generate_tests(task, mock_sandbox)
+
+        assert result.success is True
+        assert len(mock_sandbox.commands) >= 2
+        test_cmds = [cmd for cmd, _ in mock_sandbox.commands if "pytest test_" in cmd]
+        assert len(test_cmds) == 2
+
+    @pytest.mark.asyncio
+    async def test_rejects_if_any_test_passes_on_base(self):
+        """If any fail_to_pass test passes on base, reject the submission."""
+        task = SweTask(
+            id="test-preapply-4",
+            repo="owner/repo",
+            base_commit="abc123",
+            language="python",
+            prompt="Test",
+        )
+
+        invalid_submit = ToolCall(
+            id="call_submit1",
+            type="function",
+            function=FunctionCall(
+                name="submit_tests",
+                arguments='{"fail_to_pass": ["pytest test.py", "echo pass"], "pass_to_pass": [], "test_files": [], "install_commands": ["pip install"]}',
+            ),
+        )
+
+        valid_submit = ToolCall(
+            id="call_submit2",
+            type="function",
+            function=FunctionCall(
+                name="submit_tests",
+                arguments='{"fail_to_pass": ["pytest test.py"], "pass_to_pass": [], "test_files": [], "install_commands": ["pip install"]}',
+            ),
+        )
+
+        responses = [
+            create_response_with_tool_calls([invalid_submit]),
+            create_response_with_tool_calls([valid_submit]),
+        ]
+
+        mock_llm = MockLLMClient(responses)
+        mock_sandbox = MockSandbox(test_exit_code=1)
+
+        generator = TestGenerator(mock_llm, max_turns=10)
+        result = await generator.generate_tests(task, mock_sandbox)
+
+        assert result.success is True
+        assert result.fail_to_pass == ["pytest test.py"]

@@ -13,6 +13,7 @@ Key features:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from contextvars import ContextVar
@@ -47,18 +48,33 @@ MAX_AGENT_TURNS = 400
 _dataset_prompt_var: ContextVar[str] = ContextVar("dataset_prompt", default="")
 MAX_VALIDATION_RETRIES = 3
 DEFAULT_TIMEOUT_MS = 60_000
+PRE_APPLY_TIMEOUT_SECONDS = 60  # 60s timeout for pre-apply test validation
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # System Prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Write tests for this PR.
+SYSTEM_PROMPT = """Generate tests for a software bug fix.
 
+CRITICAL: Your tests MUST:
+1. FAIL on the base commit (before the patch applies)
+2. PASS after applying the patch
+
+PROCESS:
 1. Call set_dataset_prompt with a short description (5-10 words)
-2. Explore and install dependencies  
-3. Write tests
-4. Submit"""
+2. Read the patch to understand what bug is being fixed
+3. Identify the specific behavior change (bug vs fixed)
+4. Write a test that triggers the BUG behavior on base commit
+5. Run your test on base commit to verify it FAILS
+6. Apply patch: cd /repo && git apply /workspace/patch.diff
+7. Run your test after patch to verify it PASSES
+8. Submit with submit_tests()
+
+IMPORTANT:
+- Tests that always pass are INVALID (don't test the bug)
+- Tests that always fail are INVALID (wrong behavior expected)
+- You MUST run tests at least once before and after patch"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -534,6 +550,59 @@ Use set_dataset_prompt first, then write tests."""
                 is_error=True,
             )
 
+    async def _validate_pre_apply(
+        self, tests: list[str], sandbox: SandboxProtocol
+    ) -> tuple[bool, str]:
+        """Validate that tests FAIL on base commit before patch applies.
+
+        This ensures tests are actually testing the bug behavior, not just
+        passing regardless of the patch.
+
+        Args:
+            tests: List of test commands to validate.
+            sandbox: Sandbox for running tests.
+
+        Returns:
+            Tuple of (valid, error_message). valid=True if tests fail as expected.
+        """
+        if not tests:
+            return False, "No tests to validate"
+
+        # Run each test on base commit - they should all FAIL
+        for test_cmd in tests:
+            try:
+                args = ShellArgs(
+                    command=test_cmd,
+                    timeout_ms=PRE_APPLY_TIMEOUT_SECONDS * 1000,
+                )
+                result = await asyncio.wait_for(
+                    self._execute_shell(args, sandbox),
+                    timeout=PRE_APPLY_TIMEOUT_SECONDS + 10,
+                )
+
+                if not result.is_error:
+                    display_cmd = (
+                        test_cmd if len(test_cmd) <= 50 else test_cmd[:47] + "..."
+                    )
+                    return False, (
+                        f"Test '{display_cmd}' PASSED on base commit. "
+                        "Tests must FAIL on base commit before patch applies. "
+                        "This test does not test the bug behavior."
+                    )
+            except asyncio.TimeoutError:
+                display_cmd = test_cmd if len(test_cmd) <= 50 else test_cmd[:47] + "..."
+                logger.warning(
+                    f"Pre-apply test timed out after {PRE_APPLY_TIMEOUT_SECONDS}s: {display_cmd}"
+                )
+                return False, (
+                    f"TIMEOUT: Test '{display_cmd}' exceeded {PRE_APPLY_TIMEOUT_SECONDS}s. "
+                    "Consider simpler test approach or reduce test scope."
+                )
+            except Exception as e:
+                return False, f"Failed to run test '{test_cmd[:50]}': {e}"
+
+        return True, ""
+
     async def _handle_write_file(
         self, arguments: dict[str, Any], sandbox: SandboxProtocol
     ) -> ToolResult:
@@ -686,17 +755,29 @@ Use set_dataset_prompt first, then write tests."""
             logger.info(
                 f"submit_tests called with: fail_to_pass={arguments.get('fail_to_pass')}, install_commands={arguments.get('install_commands')}"
             )
-            return self._handle_submit_tests(arguments)
+            return await self._handle_submit_tests(arguments, sandbox)
 
         else:
             return ToolResult(content=f"Unknown tool: {tool_name}", is_error=True)
 
-    def _handle_submit_tests(self, arguments: dict[str, Any]) -> ToolResult:
+    async def _handle_submit_tests(
+        self, arguments: dict[str, Any], sandbox: SandboxProtocol
+    ) -> ToolResult:
         """Handle submit_tests tool call."""
         fail_to_pass = arguments.get("fail_to_pass", [])
         pass_to_pass = arguments.get("pass_to_pass", [])
         test_files_raw = arguments.get("test_files", [])
         install_commands = arguments.get("install_commands", [])
+
+        # Pre-apply validation: tests must FAIL on base commit
+        valid, error = await self._validate_pre_apply(fail_to_pass, sandbox)
+        if not valid:
+            return ToolResult(
+                content=f"PRE-APPLY VALIDATION FAILED: {error}\n\n"
+                "Rewrite tests to properly test the bug behavior. "
+                "Tests must FAIL on base commit, then PASS after the patch is applied.",
+                is_error=True,
+            )
 
         # Parse test files
         test_files: list[TestFile] = []

@@ -8,10 +8,21 @@ import subprocess
 import tempfile
 import time
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import yaml
+
+if TYPE_CHECKING:
+    from swe_forge.agents.test_repair_agent import (
+        Diagnosis,
+        Fix,
+        RepairAttempt,
+        TestRepairAgent,
+    )
+    from swe_forge.llm import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +149,100 @@ def _run_test_in_container(
     }
 
 
+def _validate_pre_apply_with_retry(
+    container_name: str,
+    test_cmd: str,
+    max_runs: int = 3,
+    required_failures: int = 2,
+    delay_seconds: float = 0.5,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Validate a test fails on base commit with retry for flaky tests.
+
+    Runs the test multiple times and requires a minimum number of failures
+    to accept the test as valid. This handles flaky tests that may pass
+    occasionally.
+
+    Args:
+        container_name: Docker container name.
+        test_cmd: Test command to run.
+        max_runs: Maximum number of test runs (default: 3).
+        required_failures: Minimum failures required to accept (default: 2).
+        delay_seconds: Delay between runs in seconds (default: 0.5).
+        timeout: Timeout per test run in seconds.
+
+    Returns:
+        Dict with keys:
+        - 'command': The test command
+        - 'failures': Number of failures
+        - 'passes': Number of passes
+        - 'results': List of individual run results
+        - 'is_flaky': Whether the test showed flaky behavior
+        - 'valid': Whether the test passes validation (enough failures)
+        - 'error': Error message if invalid, None otherwise
+    """
+    failures = 0
+    passes = 0
+    results = []
+
+    for run in range(max_runs):
+        result = _run_test_in_container(container_name, test_cmd, timeout=timeout)
+        results.append(result)
+
+        if result["success"]:
+            passes += 1
+        else:
+            failures += 1
+
+        # Early exit if we have enough failures
+        if failures >= required_failures:
+            logger.debug(
+                f"Test '{test_cmd[:50]}': Early exit after {run + 1} runs "
+                f"with {failures} failures (required: {required_failures})"
+            )
+            break
+
+        # Small delay between runs to avoid race conditions
+        if run < max_runs - 1:
+            time.sleep(delay_seconds)
+
+    # Detect flaky behavior (both passes and failures)
+    is_flaky = passes > 0 and failures > 0
+    if is_flaky:
+        logger.info(
+            f"Flaky test detected: '{test_cmd[:50]}...' - "
+            f"{failures} failures / {passes} passes across {max_runs} runs"
+        )
+
+    # Determine validity
+    valid = failures >= required_failures
+    error = None
+
+    if not valid:
+        if failures == 0:
+            error = (
+                f"Test '{test_cmd[:50]}...' passed {passes}/{max_runs} times. "
+                f"Test appears to be broken - it always passes. "
+                f"Required {required_failures}/{max_runs} failures."
+            )
+        else:
+            error = (
+                f"Test '{test_cmd[:50]}...' failed only {failures}/{max_runs} times. "
+                f"Tests must FAIL at least {required_failures}/{max_runs} times "
+                f"to verify the bug exists."
+            )
+
+    return {
+        "command": test_cmd,
+        "failures": failures,
+        "passes": passes,
+        "results": results,
+        "is_flaky": is_flaky,
+        "valid": valid,
+        "error": error,
+    }
+
+
 def _copy_tests_to_repo(container_name: str) -> None:
     """Copy tests from /workspace/tests/ to /repo/tests/ with correct paths."""
     script = """
@@ -218,27 +323,54 @@ async def verify_docker_image(
 
         _copy_tests_to_repo(container_name)
 
-        logger.info(f"  Running tests BEFORE patch...")
+        logger.info(f"  Running tests BEFORE patch (with retry for flaky tests)...")
         before_results = []
-        before_all_failed = True
+        before_validations = []
+        all_tests_valid = True
+        flaky_tests_detected = []
 
         for test_cmd in fail_to_pass:
             logger.info(f"    Test: {test_cmd[:50]}...")
-            result = _run_test_in_container(container_name, test_cmd)
-            before_results.append(result)
-            if result["success"]:
-                before_all_failed = False
-                logger.warning(f"    UNEXPECTED: Test passed before patch!")
+            validation = _validate_pre_apply_with_retry(
+                container_name,
+                test_cmd,
+                max_runs=3,
+                required_failures=2,
+                delay_seconds=0.5,
+                timeout=min(timeout // 4, 120),
+            )
+            before_validations.append(validation)
+            before_results.extend(validation["results"])
 
-        if not before_all_failed:
-            all_passed_before = all(r["success"] for r in before_results)
-            if all_passed_before:
-                return VerifyResult(
-                    success=False,
-                    before_patch_fail=False,
-                    error="All fail_to_pass tests PASS before patch - task may be invalid",
-                    details={"before_results": before_results},
+            if not validation["valid"]:
+                all_tests_valid = False
+                logger.warning(f"    INVALID: {validation['error']}")
+            elif validation["is_flaky"]:
+                flaky_tests_detected.append(test_cmd)
+                logger.info(
+                    f"    FLAKY: Test passed {validation['passes']} times, "
+                    f"failed {validation['failures']} times - accepted"
                 )
+
+        if flaky_tests_detected:
+            logger.info(
+                f"  Detected {len(flaky_tests_detected)} flaky test(s) that "
+                f"passed validation (2/3 failures required)"
+            )
+
+        if not all_tests_valid:
+            invalid_tests = [v for v in before_validations if not v["valid"]]
+            error_msgs = [v["error"] for v in invalid_tests if v["error"]]
+            return VerifyResult(
+                success=False,
+                before_patch_fail=False,
+                error="Pre-apply validation failed:\n" + "\n".join(error_msgs),
+                details={
+                    "before_results": before_results,
+                    "before_validations": before_validations,
+                    "flaky_tests": flaky_tests_detected,
+                },
+            )
 
         logger.info(f"  Applying patch...")
         patch_result = subprocess.run(
@@ -295,14 +427,15 @@ async def verify_docker_image(
 
         return VerifyResult(
             success=True,
-            before_patch_fail=before_all_failed
-            or not all(r["success"] for r in before_results),
+            before_patch_fail=True,
             after_patch_pass=after_all_passed,
             pass_to_pass_ok=pass_all_ok,
             details={
                 "before": before_results,
                 "after": after_results,
                 "pass_to_pass": pass_results,
+                "flaky_tests": flaky_tests_detected,
+                "before_validations": before_validations,
             },
         )
 
@@ -550,3 +683,142 @@ async def build_docker_images(
 
     results = await asyncio.gather(*[build_with_sem(d) for d in task_dirs])
     return list(results)
+
+
+@dataclass
+class VerifyWithRepairResult:
+    """Result of Docker verification with repair attempts."""
+
+    success: bool
+    image_name: str
+    task_id: str
+    original_error: str | None = None
+    final_error: str | None = None
+    repair_attempts: list["RepairAttempt"] = field(default_factory=list)
+    verification_details: dict | None = None
+
+
+def _apply_fix_to_workspace(workspace: dict, fix: "Fix") -> dict:
+    """Apply fix to workspace configuration."""
+    modified = dict(workspace)
+    if fix.install_commands:
+        install_config = modified.setdefault("install", {})
+        existing_commands = install_config.setdefault("commands", [])
+        for cmd in fix.install_commands:
+            if cmd not in existing_commands:
+                existing_commands.append(cmd)
+    if fix.patch_modification:
+        modified["_patch_modification"] = fix.patch_modification
+    return modified
+
+
+async def verify_with_repair(
+    image_name: str,
+    workspace: dict,
+    llm_client: "LLMClient",
+    max_retries: int = 5,
+    model: str = "openai/gpt-4o-mini",
+    timeout: int = 300,
+) -> VerifyWithRepairResult:
+    """Verify Docker image with agentic repair loop.
+
+    When verification fails, spawns an LLM agent to diagnose the failure
+    and attempt to generate a fix. Supports up to max_retries attempts.
+
+    Args:
+        image_name: Docker image name to verify.
+        workspace: Workspace configuration dictionary.
+        llm_client: LLM client for diagnosis and fix generation.
+        max_retries: Maximum repair attempts (default: 5).
+        model: LLM model to use for repair agent.
+        timeout: Verification timeout in seconds.
+
+    Returns:
+        VerifyWithRepairResult with success status and repair history.
+    """
+    from swe_forge.agents.test_repair_agent import RepairAttempt, TestRepairAgent
+
+    task_id = workspace.get("task_id", "unknown")
+    repair_agent = TestRepairAgent(llm_client, model=model)
+    repair_attempts: list[RepairAttempt] = []
+    current_workspace = dict(workspace)
+
+    result = await verify_docker_image(image_name, current_workspace, timeout)
+    if result.success:
+        return VerifyWithRepairResult(
+            success=True,
+            image_name=image_name,
+            task_id=task_id,
+            verification_details=result.details,
+        )
+
+    original_error = result.error
+    logger.info(f"Initial verification failed for {task_id}: {original_error}")
+
+    for attempt in range(1, max_retries + 1):
+        logger.info(f"Repair attempt {attempt}/{max_retries} for {task_id}")
+
+        patch = workspace.get("patch", "")
+        repo_url = workspace.get("repo", {}).get("url", "")
+
+        diagnosis = await repair_agent.diagnose_failure(
+            test_output=result.details or {},
+            patch=patch,
+            repo_url=repo_url,
+            error=result.error or "Unknown error",
+        )
+
+        repair_attempt = RepairAttempt(
+            attempt_number=attempt,
+            diagnosis=diagnosis,
+        )
+
+        if not diagnosis.fixable:
+            logger.warning(f"Task {task_id} marked as unfixable: {diagnosis.reason}")
+            repair_attempts.append(repair_attempt)
+            break
+
+        fix = await repair_agent.generate_fix(diagnosis)
+        repair_attempt.fix_applied = fix
+
+        if fix.skip_task:
+            logger.warning(f"Task {task_id} should be skipped: {fix.description}")
+            repair_attempts.append(repair_attempt)
+            break
+
+        if fix.install_commands or fix.patch_modification:
+            current_workspace = _apply_fix_to_workspace(current_workspace, fix)
+            logger.info(
+                f"Applied fix '{fix.description}' to workspace - "
+                f"install_commands: {fix.install_commands or []}"
+            )
+
+        repair_attempt.success = True
+        repair_attempts.append(repair_attempt)
+
+        result = await verify_docker_image(image_name, current_workspace, timeout)
+        if result.success:
+            logger.info(f"Task {task_id} fixed after {attempt} repair attempt(s)")
+            return VerifyWithRepairResult(
+                success=True,
+                image_name=image_name,
+                task_id=task_id,
+                original_error=original_error,
+                repair_attempts=repair_attempts,
+                verification_details=result.details,
+            )
+
+        logger.warning(f"Repair attempt {attempt} failed for {task_id}: {result.error}")
+
+    logger.error(
+        f"Task {task_id} failed after {len(repair_attempts)} repair attempt(s)"
+    )
+    return VerifyWithRepairResult(
+        success=False,
+        image_name=image_name,
+        task_id=task_id,
+        original_error=original_error,
+        final_error=result.error,
+        repair_attempts=repair_attempts,
+        verification_details=result.details,
+    )

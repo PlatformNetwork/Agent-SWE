@@ -5,7 +5,11 @@ import subprocess
 
 import pytest
 
-from swe_forge.publish.docker_builder import verify_docker_image, VerifyResult
+from swe_forge.publish.docker_builder import (
+    verify_docker_image,
+    VerifyResult,
+    _validate_pre_apply_with_retry,
+)
 
 
 @pytest.fixture
@@ -30,6 +34,156 @@ def workspace_with_tests() -> dict:
         },
         "language": "python",
     }
+
+
+class TestValidatePreApplyWithRetry:
+    """Tests for _validate_pre_apply_with_retry function (flaky test handling)."""
+
+    def test_all_failures_accepted(self):
+        """Test that 3/3 failures is accepted (valid test)."""
+        with patch(
+            "swe_forge.publish.docker_builder._run_test_in_container"
+        ) as mock_run:
+            mock_run.return_value = {
+                "command": "pytest test.py",
+                "exit_code": 1,
+                "success": False,
+                "output": "FAILED",
+                "error": "",
+            }
+
+            with patch("swe_forge.publish.docker_builder.time.sleep"):
+                result = _validate_pre_apply_with_retry(
+                    "container", "pytest test.py", max_runs=3, required_failures=2
+                )
+
+        assert result["valid"] is True
+        assert result["failures"] >= 2
+        assert result["passes"] == 0
+        assert result["is_flaky"] is False
+
+    def test_flaky_test_2_failures_1_pass_accepted(self):
+        """Test that 2/3 failures is accepted (flaky test allowed)."""
+        call_count = {"count": 0}
+
+        def mock_run_side_effect(container, cmd, timeout=120):
+            call_count["count"] += 1
+            if call_count["count"] == 2:
+                return {
+                    "command": cmd,
+                    "exit_code": 0,
+                    "success": True,
+                    "output": "PASSED",
+                    "error": "",
+                }
+            return {
+                "command": cmd,
+                "exit_code": 1,
+                "success": False,
+                "output": "FAILED",
+                "error": "",
+            }
+
+        with patch(
+            "swe_forge.publish.docker_builder._run_test_in_container",
+            side_effect=mock_run_side_effect,
+        ):
+            with patch("swe_forge.publish.docker_builder.time.sleep"):
+                result = _validate_pre_apply_with_retry(
+                    "container", "pytest test.py", max_runs=3, required_failures=2
+                )
+
+        assert result["valid"] is True
+        assert result["failures"] == 2
+        assert result["passes"] == 1
+        assert result["is_flaky"] is True
+
+    def test_flaky_test_1_failure_2_passes_rejected(self):
+        """Test that 1/3 failures is rejected (too flaky)."""
+        call_count = {"count": 0}
+
+        def mock_run_side_effect(container, cmd, timeout=120):
+            call_count["count"] += 1
+            if call_count["count"] == 2:
+                return {
+                    "command": cmd,
+                    "exit_code": 1,
+                    "success": False,
+                    "output": "FAILED",
+                    "error": "",
+                }
+            return {
+                "command": cmd,
+                "exit_code": 0,
+                "success": True,
+                "output": "PASSED",
+                "error": "",
+            }
+
+        with patch(
+            "swe_forge.publish.docker_builder._run_test_in_container",
+            side_effect=mock_run_side_effect,
+        ):
+            with patch("swe_forge.publish.docker_builder.time.sleep"):
+                result = _validate_pre_apply_with_retry(
+                    "container", "pytest test.py", max_runs=3, required_failures=2
+                )
+
+        assert result["valid"] is False
+        assert result["failures"] == 1
+        assert result["passes"] == 2
+        assert result["is_flaky"] is True
+        assert "failed only 1/3" in result["error"]
+
+    def test_all_passes_rejected(self):
+        """Test that 0/3 failures is rejected (broken test - always passes)."""
+        with patch(
+            "swe_forge.publish.docker_builder._run_test_in_container"
+        ) as mock_run:
+            mock_run.return_value = {
+                "command": "pytest test.py",
+                "exit_code": 0,
+                "success": True,
+                "output": "PASSED",
+                "error": "",
+            }
+
+            with patch("swe_forge.publish.docker_builder.time.sleep"):
+                result = _validate_pre_apply_with_retry(
+                    "container", "pytest test.py", max_runs=3, required_failures=2
+                )
+
+        assert result["valid"] is False
+        assert result["failures"] == 0
+        assert result["passes"] >= 2
+        assert "always passes" in result["error"]
+
+    def test_early_exit_on_enough_failures(self):
+        """Test that we stop early once we have enough failures."""
+        call_count = {"count": 0}
+
+        def mock_run_side_effect(container, cmd, timeout=120):
+            call_count["count"] += 1
+            return {
+                "command": cmd,
+                "exit_code": 1,
+                "success": False,
+                "output": "FAILED",
+                "error": "",
+            }
+
+        with patch(
+            "swe_forge.publish.docker_builder._run_test_in_container",
+            side_effect=mock_run_side_effect,
+        ):
+            with patch("swe_forge.publish.docker_builder.time.sleep"):
+                result = _validate_pre_apply_with_retry(
+                    "container", "pytest test.py", max_runs=3, required_failures=2
+                )
+
+        assert result["valid"] is True
+        assert result["failures"] == 2
+        assert call_count["count"] == 2
 
 
 class TestVerifyResultDataclass:
@@ -81,75 +235,50 @@ class TestVerifyDockerImage:
         self, workspace_with_tests
     ):
         """Test that verification passes when tests fail before patch and pass after."""
-        mock_results = []
-        call_count = {"count": 0}
+        with patch("swe_forge.publish.docker_builder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
 
-        def mock_run_side_effect(*args, **kwargs):
-            call_count["count"] += 1
-            mock_result = MagicMock()
-            mock_result.returncode = 0
-            mock_result.stdout = ""
-            mock_result.stderr = ""
-
-            # Handle different Docker commands
-            if "rm" in args[0] and "-f" in args[0]:
-                # Docker rm command
-                return mock_result
-            elif "run" in args[0] and "-d" in args[0]:
-                # Docker run command
-                return mock_result
-            elif "exec" in args[0] and "git apply" in str(args[0]):
-                # Patch application
-                return mock_result
-            elif "exec" in args[0] and "pytest" in str(args[0]):
-                # Test execution
-                test_phase = call_count["count"]
-                mock_result.returncode = 1 if test_phase < 50 else 0
-                return mock_result
-            elif "exec" in args[0]:
-                # Other exec commands (bash setup)
-                return mock_result
-            return mock_result
-
-        with patch(
-            "swe_forge.publish.docker_builder.subprocess.run",
-            side_effect=mock_run_side_effect,
-        ):
             with patch("swe_forge.publish.docker_builder.time.sleep"):
                 with patch(
-                    "swe_forge.publish.docker_builder._run_test_in_container"
-                ) as mock_run_test:
-                    # Before patch: tests fail
-                    # After patch: tests pass
-                    mock_run_test.side_effect = [
-                        # Before patch - tests fail (exit_code != 0)
-                        {
-                            "command": "pytest tests/test_feature.py -v",
-                            "exit_code": 1,
-                            "success": False,
-                            "output": "FAILED",
-                            "error": "AssertionError",
-                        },
-                        # After patch - tests pass (exit_code == 0)
-                        {
-                            "command": "pytest tests/test_feature.py -v",
-                            "exit_code": 0,
-                            "success": True,
-                            "output": "PASSED",
-                            "error": "",
-                        },
-                        # pass_to_pass test - passes
-                        {
-                            "command": "pytest tests/test_other.py -v",
-                            "exit_code": 0,
-                            "success": True,
-                            "output": "PASSED",
-                            "error": "",
-                        },
-                    ]
-                    result = await verify_docker_image(
-                        "test-image:latest", workspace_with_tests
-                    )
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
+                        "command": "pytest tests/test_feature.py -v",
+                        "failures": 2,
+                        "passes": 1,
+                        "results": [],
+                        "is_flaky": False,
+                        "valid": True,
+                        "error": None,
+                    }
+
+                    with patch(
+                        "swe_forge.publish.docker_builder._run_test_in_container"
+                    ) as mock_run_test:
+                        # After patch - tests pass
+                        mock_run_test.side_effect = [
+                            {
+                                "command": "pytest tests/test_feature.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                            {
+                                "command": "pytest tests/test_other.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                        ]
+
+                        result = await verify_docker_image(
+                            "test-image:latest", workspace_with_tests
+                        )
 
         assert result.success is True
         assert result.before_patch_fail is True
@@ -161,20 +290,24 @@ class TestVerifyDockerImage:
         self, workspace_with_tests
     ):
         """Test that verification fails when tests pass before patch (bug doesn't exist)."""
-        with patch("swe_forge.publish.docker_builder.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("swe_forge.publish.docker_builder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
 
             with patch("swe_forge.publish.docker_builder.time.sleep"):
                 with patch(
-                    "swe_forge.publish.docker_builder._run_test_in_container"
-                ) as mock_run_test:
-                    # Before patch - tests PASS (shouldn't happen for valid task)
-                    mock_run_test.return_value = {
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
                         "command": "pytest tests/test_feature.py -v",
-                        "exit_code": 0,
-                        "success": True,
-                        "output": "PASSED",
-                        "error": "",
+                        "failures": 0,
+                        "passes": 3,
+                        "results": [],
+                        "is_flaky": False,
+                        "valid": False,
+                        "error": "Test passed 3/3 times - test appears broken",
                     }
 
                     result = await verify_docker_image(
@@ -183,50 +316,46 @@ class TestVerifyDockerImage:
 
         assert result.success is False
         assert result.before_patch_fail is False
-        assert "PASS before patch" in result.error
+        assert "Pre-apply validation failed" in result.error
 
     @pytest.mark.asyncio
     async def test_verify_fails_when_tests_fail_after_patch(self, workspace_with_tests):
         """Test that verification fails when tests still fail after patch (patch doesn't fix bug)."""
-        mock_run_test_calls = []
-
-        def mock_run_test_side_effect(container_name, test_cmd, timeout=120):
-            call_count = len(mock_run_test_calls)
-            mock_run_test_calls.append(call_count)
-
-            # First call: before patch - test fails
-            if call_count == 0:
-                return {
-                    "command": test_cmd,
-                    "exit_code": 1,
-                    "success": False,
-                    "output": "FAILED",
-                    "error": "AssertionError",
-                }
-            # Second call: after patch - test still fails
-            return {
-                "command": test_cmd,
-                "exit_code": 1,
-                "success": False,
-                "output": "FAILED",
-                "error": "AssertionError still",
-            }
-
-        with patch("swe_forge.publish.docker_builder.subprocess.run") as mock_run:
-            mock_result = MagicMock()
-            mock_result.returncode = 0
-            mock_result.stdout = ""
-            mock_result.stderr = ""
-            mock_run.return_value = mock_result
+        with patch("swe_forge.publish.docker_builder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
 
             with patch("swe_forge.publish.docker_builder.time.sleep"):
                 with patch(
-                    "swe_forge.publish.docker_builder._run_test_in_container",
-                    side_effect=mock_run_test_side_effect,
-                ):
-                    result = await verify_docker_image(
-                        "test-image:latest", workspace_with_tests
-                    )
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
+                        "command": "pytest tests/test_feature.py -v",
+                        "failures": 2,
+                        "passes": 0,
+                        "results": [],
+                        "is_flaky": False,
+                        "valid": True,
+                        "error": None,
+                    }
+
+                    with patch(
+                        "swe_forge.publish.docker_builder._run_test_in_container"
+                    ) as mock_run_test:
+                        # After patch - test still fails
+                        mock_run_test.return_value = {
+                            "command": "pytest tests/test_feature.py -v",
+                            "exit_code": 1,
+                            "success": False,
+                            "output": "FAILED",
+                            "error": "AssertionError still",
+                        }
+
+                        result = await verify_docker_image(
+                            "test-image:latest", workspace_with_tests
+                        )
 
         assert result.success is False
         assert result.before_patch_fail is True
@@ -239,7 +368,7 @@ class TestVerifyDockerImage:
         workspace = {
             "task_id": "test-owner-repo-123",
             "tests": {
-                "fail_to_pass": [],  # Empty
+                "fail_to_pass": [],
                 "pass_to_pass": ["pytest tests/test_other.py -v"],
             },
         }
@@ -252,22 +381,10 @@ class TestVerifyDockerImage:
     @pytest.mark.asyncio
     async def test_verify_handles_patch_failure(self, workspace_with_tests):
         """Test that verification handles patch application failures."""
-        mock_run_test_calls = []
-
-        def mock_run_test_side_effect(container_name, test_cmd, timeout=120):
-            mock_run_test_calls.append(1)
-            return {
-                "command": test_cmd,
-                "exit_code": 1,
-                "success": False,
-                "output": "FAILED",
-                "error": "AssertionError",
-            }
 
         def mock_subprocess_run(*args, **kwargs):
             mock_result = MagicMock()
-            # Docker exec with git apply fails
-            if "exec" in args[0] and "git apply" in str(args[0]):
+            if "exec" in str(args) and "git apply" in str(args):
                 mock_result.returncode = 1
                 mock_result.stderr = "error: patch failed"
             else:
@@ -281,9 +398,18 @@ class TestVerifyDockerImage:
         ):
             with patch("swe_forge.publish.docker_builder.time.sleep"):
                 with patch(
-                    "swe_forge.publish.docker_builder._run_test_in_container",
-                    side_effect=mock_run_test_side_effect,
-                ):
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
+                        "command": "pytest tests/test_feature.py -v",
+                        "failures": 2,
+                        "passes": 0,
+                        "results": [],
+                        "is_flaky": False,
+                        "valid": True,
+                        "error": None,
+                    }
+
                     result = await verify_docker_image(
                         "test-image:latest", workspace_with_tests
                     )
@@ -298,13 +424,8 @@ class TestVerifyDockerImage:
 
         def mock_run_side_effect(*args, **kwargs):
             call_count["count"] += 1
-            # First call is docker rm cleanup (before starting) - should succeed
-            if call_count["count"] == 1:
-                return MagicMock(returncode=0, stdout="", stderr="")
-            # Second call is docker run - raise timeout
             if call_count["count"] == 2:
                 raise subprocess.TimeoutExpired(cmd="docker", timeout=300)
-            # Finally block calls docker rm again - should succeed for cleanup
             return MagicMock(returncode=0, stdout="", stderr="")
 
         with patch(
@@ -322,126 +443,110 @@ class TestVerifyDockerImage:
     @pytest.mark.asyncio
     async def test_verify_handles_regression(self, workspace_with_tests):
         """Test detection of pass_to_pass regression (tests that should stay passing fail)."""
-        with patch("swe_forge.publish.docker_builder.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("swe_forge.publish.docker_builder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
 
             with patch("swe_forge.publish.docker_builder.time.sleep"):
                 with patch(
-                    "swe_forge.publish.docker_builder._run_test_in_container"
-                ) as mock_run_test:
-                    mock_run_test.side_effect = [
-                        # Before patch - fail_to_pass test fails
-                        {
-                            "command": "pytest tests/test_feature.py -v",
-                            "exit_code": 1,
-                            "success": False,
-                            "output": "FAILED",
-                            "error": "",
-                        },
-                        # After patch - fail_to_pass test passes
-                        {
-                            "command": "pytest tests/test_feature.py -v",
-                            "exit_code": 0,
-                            "success": True,
-                            "output": "PASSED",
-                            "error": "",
-                        },
-                        # pass_to_pass test FAILS (regression!)
-                        {
-                            "command": "pytest tests/test_other.py -v",
-                            "exit_code": 1,
-                            "success": False,
-                            "output": "FAILED",
-                            "error": "Regression",
-                        },
-                    ]
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
+                        "command": "pytest tests/test_feature.py -v",
+                        "failures": 2,
+                        "passes": 0,
+                        "results": [],
+                        "is_flaky": False,
+                        "valid": True,
+                        "error": None,
+                    }
 
-                    result = await verify_docker_image(
-                        "test-image:latest", workspace_with_tests
-                    )
+                    with patch(
+                        "swe_forge.publish.docker_builder._run_test_in_container"
+                    ) as mock_run_test:
+                        mock_run_test.side_effect = [
+                            {
+                                "command": "pytest tests/test_feature.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                            {
+                                "command": "pytest tests/test_other.py -v",
+                                "exit_code": 1,
+                                "success": False,
+                                "output": "FAILED",
+                                "error": "Regression",
+                            },
+                        ]
 
-        assert result.success is True  # Main verification passes
+                        result = await verify_docker_image(
+                            "test-image:latest", workspace_with_tests
+                        )
+
+        assert result.success is True
         assert result.before_patch_fail is True
         assert result.after_patch_pass is True
-        assert result.pass_to_pass_ok is False  # Regression detected
+        assert result.pass_to_pass_ok is False
 
 
 class TestVerifyDockerImageFlakyTests:
     """Tests for flaky test handling."""
 
     @pytest.mark.asyncio
-    async def test_verify_with_partial_before_failure(self, workspace_with_tests):
-        """Test handling when only some tests fail before patch (partial failure)."""
-        workspace_with_tests["tests"]["fail_to_pass"] = [
-            "pytest tests/test_a.py -v",
-            "pytest tests/test_b.py -v",
-        ]
-
-        call_index = {"count": 0}
-
-        def mock_run_test_side_effect(container_name, test_cmd, timeout=120):
-            call_index["count"] += 1
-            count = call_index["count"]
-
-            # Calls 1-2: before patch (test_a fails, test_b passes - partial)
-            # Calls 3-4: after patch (both pass)
-            if count == 1:
-                return {
-                    "command": test_cmd,
-                    "exit_code": 1,
-                    "success": False,
-                    "output": "FAILED",
-                    "error": "",
-                }
-            elif count == 2:
-                # This is called but we check if ALL passed before patch
-                return {
-                    "command": test_cmd,
-                    "exit_code": 0,  # One test passes before patch
-                    "success": True,
-                    "output": "PASSED",
-                    "error": "",
-                }
-            elif count == 3:
-                return {
-                    "command": test_cmd,
-                    "exit_code": 0,
-                    "success": True,
-                    "output": "PASSED",
-                    "error": "",
-                }
-            elif count == 4:
-                return {
-                    "command": test_cmd,
-                    "exit_code": 0,
-                    "success": True,
-                    "output": "PASSED",
-                    "error": "",
-                }
-            return {
-                "command": test_cmd,
-                "exit_code": 0,
-                "success": True,
-                "output": "PASSED",
-                "error": "",
-            }
-
-        with patch("swe_forge.publish.docker_builder.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    async def test_verify_with_flaky_test_accepted(self, workspace_with_tests):
+        """Test handling when test is flaky (2/3 failures) - should be accepted."""
+        with patch("swe_forge.publish.docker_builder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
 
             with patch("swe_forge.publish.docker_builder.time.sleep"):
                 with patch(
-                    "swe_forge.publish.docker_builder._run_test_in_container",
-                    side_effect=mock_run_test_side_effect,
-                ):
-                    result = await verify_docker_image(
-                        "test-image:latest", workspace_with_tests
-                    )
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
+                        "command": "pytest tests/test_feature.py -v",
+                        "failures": 2,
+                        "passes": 1,
+                        "results": [],
+                        "is_flaky": True,
+                        "valid": True,
+                        "error": None,
+                    }
 
-        # Should succeed because not all tests passed before patch (at least one failed)
+                    with patch(
+                        "swe_forge.publish.docker_builder._run_test_in_container"
+                    ) as mock_run_test:
+                        mock_run_test.side_effect = [
+                            {
+                                "command": "pytest tests/test_feature.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                            {
+                                "command": "pytest tests/test_other.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                        ]
+
+                        result = await verify_docker_image(
+                            "test-image:latest", workspace_with_tests
+                        )
+
         assert result.success is True
         assert result.before_patch_fail is True
         assert result.after_patch_pass is True
+        assert "flaky_tests" in result.details
 
     @pytest.mark.asyncio
     async def test_verify_with_multiple_fail_to_pass_tests(self, workspace_with_tests):
@@ -451,42 +556,140 @@ class TestVerifyDockerImageFlakyTests:
             "pytest tests/test_b.py -v",
         ]
 
-        call_index = {"count": 0}
-
-        def mock_run_test_side_effect(container_name, test_cmd, timeout=120):
-            call_index["count"] += 1
-            count = call_index["count"]
-
-            # Before patch: both fail
-            if count in (1, 2):
-                return {
-                    "command": test_cmd,
-                    "exit_code": 1,
-                    "success": False,
-                    "output": "FAILED",
-                    "error": "",
-                }
-            # After patch: both pass
-            return {
-                "command": test_cmd,
-                "exit_code": 0,
-                "success": True,
-                "output": "PASSED",
-                "error": "",
-            }
-
-        with patch("swe_forge.publish.docker_builder.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("swe_forge.publish.docker_builder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
 
             with patch("swe_forge.publish.docker_builder.time.sleep"):
                 with patch(
-                    "swe_forge.publish.docker_builder._run_test_in_container",
-                    side_effect=mock_run_test_side_effect,
-                ):
-                    result = await verify_docker_image(
-                        "test-image:latest", workspace_with_tests
-                    )
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
+                        "command": "pytest tests/test_a.py -v",
+                        "failures": 2,
+                        "passes": 0,
+                        "results": [],
+                        "is_flaky": False,
+                        "valid": True,
+                        "error": None,
+                    }
+
+                    with patch(
+                        "swe_forge.publish.docker_builder._run_test_in_container"
+                    ) as mock_run_test:
+                        mock_run_test.side_effect = [
+                            {
+                                "command": "pytest tests/test_a.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                            {
+                                "command": "pytest tests/test_b.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                            {
+                                "command": "pytest tests/test_other.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                        ]
+
+                        result = await verify_docker_image(
+                            "test-image:latest", workspace_with_tests
+                        )
 
         assert result.success is True
         assert result.before_patch_fail is True
         assert result.after_patch_pass is True
+
+    @pytest.mark.asyncio
+    async def test_verify_rejects_too_flaky_test(self, workspace_with_tests):
+        """Test that test with only 1/3 failures is rejected."""
+        with patch("swe_forge.publish.docker_builder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
+
+            with patch("swe_forge.publish.docker_builder.time.sleep"):
+                with patch(
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
+                        "command": "pytest tests/test_feature.py -v",
+                        "failures": 1,
+                        "passes": 2,
+                        "results": [],
+                        "is_flaky": True,
+                        "valid": False,
+                        "error": "Test failed only 1/3 times",
+                    }
+
+                    result = await verify_docker_image(
+                        "test-image:latest", workspace_with_tests
+                    )
+
+        assert result.success is False
+        assert "Pre-apply validation failed" in result.error
+
+    @pytest.mark.asyncio
+    async def test_verify_detects_flaky_tests_in_details(self, workspace_with_tests):
+        """Test that flaky tests are logged in the result details."""
+        with patch("swe_forge.publish.docker_builder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
+
+            with patch("swe_forge.publish.docker_builder.time.sleep"):
+                with patch(
+                    "swe_forge.publish.docker_builder._validate_pre_apply_with_retry"
+                ) as mock_validate:
+                    mock_validate.return_value = {
+                        "command": "pytest tests/test_feature.py -v",
+                        "failures": 2,
+                        "passes": 1,
+                        "results": [],
+                        "is_flaky": True,
+                        "valid": True,
+                        "error": None,
+                    }
+
+                    with patch(
+                        "swe_forge.publish.docker_builder._run_test_in_container"
+                    ) as mock_run_test:
+                        mock_run_test.side_effect = [
+                            {
+                                "command": "pytest tests/test_feature.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                            {
+                                "command": "pytest tests/test_other.py -v",
+                                "exit_code": 0,
+                                "success": True,
+                                "output": "PASSED",
+                                "error": "",
+                            },
+                        ]
+
+                        result = await verify_docker_image(
+                            "test-image:latest", workspace_with_tests
+                        )
+
+        assert result.success is True
+        assert result.details is not None
+        assert "flaky_tests" in result.details
+        assert "before_validations" in result.details
+        assert len(result.details["flaky_tests"]) > 0
