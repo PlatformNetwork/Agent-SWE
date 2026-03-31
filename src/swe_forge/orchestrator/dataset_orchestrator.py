@@ -13,8 +13,11 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from .models import (
+    BuildDockerResult,
+    GenerateTestsResult,
     OrchestratorTask,
     TaskState,
+    ValidateTestsResult,
 )
 from .tools import (
     build_docker,
@@ -64,6 +67,8 @@ class DatasetOrchestrator:
         model: str = "openai/gpt-4o",
         docker_username: str = "swe-forge",
         push_images: bool = False,
+        skip_generation: bool = False,
+        use_existing_image: bool = False,
     ) -> None:
         """Initialize the DatasetOrchestrator.
 
@@ -76,6 +81,7 @@ class DatasetOrchestrator:
             model: Model to use for LLM operations (default: gpt-4o).
             docker_username: Docker Hub username for image naming.
             push_images: Whether to push Docker images to registry.
+            skip_generation: Whether to skip test generation if tests already exist.
         """
         self.orchestrator_id = orchestrator_id
         self.llm_client = llm_client
@@ -85,6 +91,8 @@ class DatasetOrchestrator:
         self.model = model
         self.docker_username = docker_username
         self.push_images = push_images
+        self.skip_generation = skip_generation
+        self.use_existing_image = use_existing_image
 
     async def run_pipeline(self, task: OrchestratorTask) -> OrchestratorTask:
         """Run the full pipeline for a single task.
@@ -116,61 +124,97 @@ class DatasetOrchestrator:
 
     async def _run_pipeline_inner(self, task: OrchestratorTask) -> OrchestratorTask:
         """Inner pipeline implementation with exception handling at top level."""
-        # 1. GENERATE_TESTS
-        task.transition_to(TaskState.GENERATING_TESTS)
-        generate_result = await generate_tests(
-            task_id=task.task_id,
-            patch=task.patch,
-            repo_url=task.repo_url,
-            base_commit=task.base_commit,
-            language=task.language,
-            llm_client=self.llm_client,
-            model=self.model,
-        )
+        # 1. GENERATE_TESTS (skip if tests already exist)
+        if self.skip_generation and task.tests.get("fail_to_pass"):
+            logger.info(
+                f"[{self.orchestrator_id}] Skipping test generation, using existing tests"
+            )
+            task.transition_to(TaskState.GENERATING_TESTS)
+            generate_result = GenerateTestsResult(
+                success=True,
+                tests=task.tests,
+                test_files=task.test_files,
+                install_commands=task.install_commands,
+            )
+        else:
+            task.transition_to(TaskState.GENERATING_TESTS)
+            generate_result = await generate_tests(
+                task_id=task.task_id,
+                patch=task.patch,
+                repo_url=task.repo_url,
+                base_commit=task.base_commit,
+                language=task.language,
+                llm_client=self.llm_client,
+                model=self.model,
+            )
         task.generate_result = generate_result
         task.tests = generate_result.tests
 
         if not generate_result.success:
             return self._reject(task, "Test generation failed", generate_result.error)
 
-        # 2. VALIDATING_TESTS
-        task.transition_to(TaskState.VALIDATING_TESTS)
-        test_files_for_validation = [
-            {"path": tf.path, "content": tf.content}
-            for tf in generate_result.test_files
-        ]
-        validate_result = await validate_tests(
-            task_id=task.task_id,
-            tests=test_files_for_validation,
-            patch=task.patch,
-        )
-        task.validate_result = validate_result
+        # 2. VALIDATING_TESTS (skip if no test files to validate)
+        if generate_result.test_files:
+            task.transition_to(TaskState.VALIDATING_TESTS)
+            test_files_for_validation = [
+                {"path": tf.path, "content": tf.content}
+                for tf in generate_result.test_files
+            ]
+            validate_result = await validate_tests(
+                task_id=task.task_id,
+                tests=test_files_for_validation,
+                patch=task.patch,
+            )
+            task.validate_result = validate_result
 
-        if not validate_result.success:
-            return self._reject(
-                task,
-                "Test validation failed",
-                "; ".join(validate_result.issues)
-                if validate_result.issues
-                else validate_result.error,
+            if not validate_result.success:
+                return self._reject(
+                    task,
+                    "Test validation failed",
+                    "; ".join(validate_result.issues)
+                    if validate_result.issues
+                    else validate_result.error,
+                )
+        else:
+            # No test files to validate, skip validation
+            logger.info(
+                f"[{self.orchestrator_id}] Skipping test validation (no test files)"
+            )
+            task.transition_to(TaskState.VALIDATING_TESTS)
+            task.validate_result = ValidateTestsResult(
+                success=True,
+                has_valid_syntax=True,
+                has_assertions=True,
+                relevant_to_patch=True,
             )
 
-        # 3. BUILDING_DOCKER
-        task.transition_to(TaskState.BUILDING_DOCKER)
-        test_files_for_build = [
-            {"path": tf.path, "content": tf.content}
-            for tf in generate_result.test_files
-        ]
-        build_result = await build_docker(
-            task_id=task.task_id,
-            tests=test_files_for_build,
-            repo_url=task.repo_url,
-            base_commit=task.base_commit,
-            language=task.language,
-            docker_username=self.docker_username,
-            push=self.push_images,
-            install_commands=generate_result.install_commands,
-        )
+        # 3. BUILDING_DOCKER (skip if using existing image)
+        if self.use_existing_image and task.docker_image:
+            logger.info(
+                f"[{self.orchestrator_id}] Using existing Docker image: {task.docker_image}"
+            )
+            task.transition_to(TaskState.BUILDING_DOCKER)
+            build_result = BuildDockerResult(
+                success=True,
+                image_name=task.docker_image,
+                build_time_seconds=0.0,
+            )
+        else:
+            task.transition_to(TaskState.BUILDING_DOCKER)
+            test_files_for_build = [
+                {"path": tf.path, "content": tf.content}
+                for tf in generate_result.test_files
+            ]
+            build_result = await build_docker(
+                task_id=task.task_id,
+                tests=test_files_for_build,
+                repo_url=task.repo_url,
+                base_commit=task.base_commit,
+                language=task.language,
+                docker_username=self.docker_username,
+                push=self.push_images,
+                install_commands=generate_result.install_commands,
+            )
         task.build_result = build_result
 
         if not build_result.success:
@@ -378,6 +422,7 @@ class DatasetOrchestrator:
             f"DatasetOrchestrator("
             f"id={self.orchestrator_id}, "
             f"min_score={self.min_score_threshold}, "
-            f"max_repair={self.max_repair_attempts}"
+            f"max_repair={self.max_repair_attempts}, "
+            f"use_existing_image={self.use_existing_image}"
             f")"
         )

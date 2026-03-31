@@ -39,6 +39,8 @@ class MasterOrchestrator:
         model: Model to use for LLM operations.
         docker_username: Docker Hub username for image naming.
         push_images: Whether to push Docker images to registry.
+        skip_generation: Whether to skip test generation phase.
+        use_existing_image: Whether to use existing Docker image instead of building.
     """
 
     def __init__(
@@ -51,6 +53,8 @@ class MasterOrchestrator:
         model: str = "openai/gpt-4o",
         docker_username: str = "swe-forge",
         push_images: bool = False,
+        skip_generation: bool = False,
+        use_existing_image: bool = False,
     ) -> None:
         """Initialize the MasterOrchestrator.
 
@@ -63,6 +67,8 @@ class MasterOrchestrator:
             model: Model to use for LLM operations (default: gpt-4o).
             docker_username: Docker Hub username for image naming.
             push_images: Whether to push Docker images to registry.
+            skip_generation: Whether to skip test generation phase.
+            use_existing_image: Whether to use existing Docker image instead of building.
         """
         self.parallel = parallel
         self.llm_client = llm_client
@@ -72,6 +78,8 @@ class MasterOrchestrator:
         self.model = model
         self.docker_username = docker_username
         self.push_images = push_images
+        self.skip_generation = skip_generation
+        self.use_existing_image = use_existing_image
         self._stats = OrchestratorStats()
 
     @property
@@ -115,6 +123,8 @@ class MasterOrchestrator:
                         model=self.model,
                         docker_username=self.docker_username,
                         push_images=self.push_images,
+                        skip_generation=self.skip_generation,
+                        use_existing_image=self.use_existing_image,
                     )
                     return await orchestrator.run_pipeline(task)
                 except Exception as e:

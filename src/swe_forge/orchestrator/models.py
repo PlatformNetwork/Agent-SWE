@@ -191,9 +191,15 @@ class OrchestratorTask:
         state: Current state in the pipeline
         repo_url: URL of the repository
         base_commit: Git commit to start from
+        merge_commit: Git merge commit SHA
         patch: The patch to apply
         language: Programming language detected
         tests: Test specifications
+        docker_image: Docker image name for the task
+        test_files: Generated test files
+        install_commands: Commands to install dependencies
+        difficulty_score: Difficulty score (0.0-1.0)
+        prompt: Task description prompt
         generate_result: Result from test generation stage
         validate_result: Result from test validation stage
         build_result: Result from Docker build stage
@@ -210,9 +216,15 @@ class OrchestratorTask:
     state: TaskState = TaskState.PENDING
     repo_url: str = ""
     base_commit: str = ""
+    merge_commit: str = ""
     patch: str = ""
     language: str = "unknown"
     tests: dict[str, list[str]] = field(default_factory=dict)
+    test_files: list[TestFile] = field(default_factory=list)
+    install_commands: list[str] = field(default_factory=list)
+    docker_image: str = ""
+    difficulty_score: float = 0.0
+    prompt: str = ""
 
     # Stage results
     generate_result: GenerateTestsResult | None = None
