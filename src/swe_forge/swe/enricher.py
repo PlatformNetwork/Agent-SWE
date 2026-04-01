@@ -227,6 +227,9 @@ class EnrichedPullRequest(BaseModel):
     linked_issues: list[int] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
 
+    # Store the PR diff to avoid duplicate API calls
+    diff: str = Field(default="")
+
 
 async def enrich_pr(
     event: GhArchiveEvent,
@@ -296,6 +299,7 @@ async def enrich_pr(
         is_bot=is_bot(user_login),
         linked_issues=extract_linked_issues(body_text),
         metadata=metadata,
+        diff=diff or "",
     )
 
 

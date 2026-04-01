@@ -278,13 +278,13 @@ class SwePipeline:
             metrics: Benchmark metrics to update.
 
         Returns:
-            UnghRepo if repo passes filters, None if rejected or on error.
+            UnghRepo if repo passes filters, None if rejected.
         """
-        try:
-            parts = event.repository.split("/", 1)
-            owner = parts[0]
-            repo = parts[1] if len(parts) > 1 else ""
+        parts = event.repository.split("/", 1)
+        owner = parts[0]
+        repo = parts[1] if len(parts) > 1 else ""
 
+        try:
             repo_info = await self.ungh_client.get_repo(owner, repo)
 
             if self.config.min_stars and repo_info.stars < self.config.min_stars:
@@ -299,8 +299,31 @@ class SwePipeline:
             return repo_info
 
         except Exception as e:
-            logger.warning("UNgh failed for %s: %s", event.repository, e)
-            return None
+            logger.warning(
+                "UNgh failed for %s: %s, falling back to event.stars",
+                event.repository,
+                e,
+            )
+
+            if self.config.min_stars and event.stars < self.config.min_stars:
+                logger.debug(
+                    "Prefilter rejected %s - fallback stars %d < %d",
+                    event.repository,
+                    event.stars,
+                    self.config.min_stars,
+                )
+                return None
+
+            return UnghRepo(
+                id=0,
+                name=repo,
+                owner=owner,
+                description="",
+                stars=event.stars,
+                default_branch="main",
+                created_at="",
+                updated_at="",
+            )
 
     async def _enrich_stage(
         self,
@@ -623,15 +646,33 @@ class SwePipeline:
                 else:
                     metrics.quality_failed += 1
 
-                if generated.turn_count <= 2:
-                    task.difficulty_score = 1
-                    metrics.difficulty_easy += 1
-                elif generated.turn_count <= 5:
-                    task.difficulty_score = 2
-                    metrics.difficulty_medium += 1
+                classifier = self._get_classifier()
+                if classifier is not None:
+                    pr_info = PRInfo(title=enriched.title, body=enriched.body or "")
+                    task_info = TaskInfo(
+                        pr_info=pr_info,
+                        files_changed=enriched.files_changed,
+                        lines_added=enriched.additions,
+                        lines_removed=enriched.deletions,
+                        file_paths=enriched.changed_files,
+                    )
+                    response: ClassifyResponse = await classifier.classify_full(
+                        task_info
+                    )
+                    task.difficulty_score = max(1, min(10, int(response.score * 10)))
+                    if response.difficulty == "easy":
+                        metrics.difficulty_easy += 1
+                    elif response.difficulty == "medium":
+                        metrics.difficulty_medium += 1
+                    else:
+                        metrics.difficulty_hard += 1
                 else:
-                    task.difficulty_score = 3
-                    metrics.difficulty_hard += 1
+                    task.difficulty_score = 0
+                    logger.warning(
+                        "No difficulty classifier for %s#%d, skipping scoring",
+                        enriched.repo,
+                        enriched.number,
+                    )
 
                 await self._emit_event(
                     event_queue,
@@ -697,35 +738,19 @@ class SwePipeline:
     async def _extract_patch(self, enriched: EnrichedPullRequest) -> tuple[str, str]:
         """Extract and separate patch into main and test patches.
 
-        Fetches PR diff from GitHub API and separates it into:
+        Uses the cached diff from enrichment to avoid duplicate API calls.
+        Separates diff into:
         - patch: hunks from non-test files
         - test_patch: hunks from test files
 
         Args:
-            enriched: Enriched PR data containing repo and PR number.
+            enriched: Enriched PR data containing repo, PR number, and cached diff.
 
         Returns:
             Tuple of (patch, test_patch) strings. Returns ('', '') if diff is empty.
         """
-        # Parse repo format: "owner/repo"
-        parts = enriched.repo.split("/", 1)
-        if len(parts) != 2:
-            logger.warning("Invalid repo format: %s", enriched.repo)
-            return "", ""
-
-        owner, repo = parts[0], parts[1]
-
-        try:
-            diff = await self.gh_client.get_pr_diff(owner, repo, enriched.number)
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch diff for %s#%d: %s",
-                enriched.repo,
-                enriched.number,
-                e,
-            )
-            return "", ""
-
+        # Use cached diff from enrichment (avoid duplicate API call)
+        diff = enriched.diff
         if not diff:
             return "", ""
 

@@ -271,9 +271,12 @@ class TestGeneratorResultsMappedToTask:
         assert task.status == SweTaskStatus.READY
 
     @pytest.mark.asyncio
-    async def test_quality_score_and_difficulty_from_turn_count(
+    async def test_quality_score_and_difficulty_from_llm(
         self, mock_gh_client, sample_enriched_pr
     ):
+        from unittest.mock import AsyncMock
+        from swe_forge.swe.difficulty import ClassifyResponse
+
         generated_result = GeneratedTests(
             fail_to_pass=["pytest test.py"],
             pass_to_pass=[],
@@ -284,7 +287,21 @@ class TestGeneratorResultsMappedToTask:
         )
 
         mock_generator = MockTestGenerator(generated_result)
-        config = SwePipelineConfig(test_generator=mock_generator)
+
+        mock_classifier = MagicMock()
+        mock_classifier.classify_full = AsyncMock(
+            return_value=ClassifyResponse(
+                difficulty="hard",
+                score=0.75,
+                quality_good=True,
+                reasoning="Complex changes",
+            )
+        )
+
+        config = SwePipelineConfig(
+            test_generator=mock_generator,
+            difficulty_classifier=mock_classifier,
+        )
         pipeline = SwePipeline(mock_gh_client, config=config)
 
         task = SweTask(
@@ -303,13 +320,16 @@ class TestGeneratorResultsMappedToTask:
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
-        assert task.difficulty_score == 3
+        assert task.difficulty_score == 7
         assert metrics.difficulty_hard == 1
 
     @pytest.mark.asyncio
-    async def test_low_turn_count_easy_difficulty(
+    async def test_llm_classify_easy_difficulty(
         self, mock_gh_client, sample_enriched_pr
     ):
+        from unittest.mock import AsyncMock
+        from swe_forge.swe.difficulty import ClassifyResponse
+
         generated_result = GeneratedTests(
             fail_to_pass=["pytest test.py"],
             pass_to_pass=[],
@@ -320,7 +340,18 @@ class TestGeneratorResultsMappedToTask:
         )
 
         mock_generator = MockTestGenerator(generated_result)
-        config = SwePipelineConfig(test_generator=mock_generator)
+
+        mock_classifier = MagicMock()
+        mock_classifier.classify_full = AsyncMock(
+            return_value=ClassifyResponse(
+                difficulty="easy", score=0.2, quality_good=True, reasoning="Simple fix"
+            )
+        )
+
+        config = SwePipelineConfig(
+            test_generator=mock_generator,
+            difficulty_classifier=mock_classifier,
+        )
         pipeline = SwePipeline(mock_gh_client, config=config)
 
         task = SweTask(
@@ -339,7 +370,7 @@ class TestGeneratorResultsMappedToTask:
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
-        assert task.difficulty_score == 1
+        assert task.difficulty_score == 2
         assert metrics.difficulty_easy == 1
 
 
