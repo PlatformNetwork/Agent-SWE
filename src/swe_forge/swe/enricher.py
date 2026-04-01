@@ -9,7 +9,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from .gharchive import GhArchiveEvent
-from .github_api import GitHubClient, PullRequest, PRFile
+from .github_api import GitHubClient
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,66 @@ def detect_language(files: list[str]) -> str:
     return counts.most_common(1)[0][0] if counts else "unknown"
 
 
+def parse_files_from_diff(diff: str) -> list[str]:
+    """Extract changed file paths from unified diff.
+
+    Parses 'diff --git a/path b/path' headers to get file paths.
+
+    Args:
+        diff: Unified diff string.
+
+    Returns:
+        List of file paths (the 'b/' version representing new files).
+    """
+    files: list[str] = []
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            # Format: diff --git a/path/to/file b/path/to/file
+            parts = line.split(" ")
+            if len(parts) >= 4:
+                # Get the 'b/' version (new file path)
+                path = parts[3].lstrip("b/")
+                if path:
+                    files.append(path)
+    return files
+
+
+def count_additions(diff: str) -> int:
+    """Count addition lines in unified diff.
+
+    Counts lines starting with '+' but not '+++' (file headers).
+
+    Args:
+        diff: Unified diff string.
+
+    Returns:
+        Number of addition lines.
+    """
+    return sum(
+        1
+        for line in diff.split("\n")
+        if line.startswith("+") and not line.startswith("+++")
+    )
+
+
+def count_deletions(diff: str) -> int:
+    """Count deletion lines in unified diff.
+
+    Counts lines starting with '-' but not '---' (file headers).
+
+    Args:
+        diff: Unified diff string.
+
+    Returns:
+        Number of deletion lines.
+    """
+    return sum(
+        1
+        for line in diff.split("\n")
+        if line.startswith("-") and not line.startswith("---")
+    )
+
+
 def extract_linked_issues(body: str) -> list[int]:
     """Extract issue numbers linked in PR body (fixes #N, closes #N, etc.)."""
     if not body:
@@ -172,38 +232,34 @@ async def enrich_pr(
     event: GhArchiveEvent,
     github_client: GitHubClient,
 ) -> EnrichedPullRequest:
-    """Enrich GH Archive event with GitHub API data.
+    """Enrich GH Archive event with GitHub API diff.
 
-    Fetches PR details and files in parallel, combining with event data.
-    Falls back to event data on API failures.
+    Fetches only the PR diff (single API call) and extracts file info from it.
+    Uses GH Archive event data for PR metadata (title, body, user, timestamps).
     """
     parts = event.repository.split("/", 1)
     owner = parts[0]
     repo_name = parts[1] if len(parts) > 1 else ""
 
-    pr_data: PullRequest | None = None
-    pr_files: list[PRFile] = []
+    diff: str | None = None
 
     try:
-        pr_data, pr_files = await asyncio.gather(
-            github_client.get_pr(owner, repo_name, event.pull_number),
-            github_client.get_pr_files(owner, repo_name, event.pull_number),
-        )
+        diff = await github_client.get_pr_diff(owner, repo_name, event.pull_number)
     except Exception as e:
         logger.warning(
             f"GitHub API failed for {event.repository}#{event.pull_number}: {e}"
         )
 
-    changed_paths = [f.filename for f in pr_files]
-    total_additions = sum(f.additions for f in pr_files)
-    total_deletions = sum(f.deletions for f in pr_files)
+    changed_paths = parse_files_from_diff(diff) if diff else []
+    total_additions = count_additions(diff) if diff else 0
+    total_deletions = count_deletions(diff) if diff else 0
 
     language = detect_language(changed_paths)
     if language == "unknown" and event.language_hint:
         language = event.language_hint
 
-    user_login = pr_data.user_login if pr_data else event.user
-    body_text = (pr_data.body if pr_data and pr_data.body else event.body) or ""
+    user_login = event.user
+    body_text = event.body or ""
 
     metadata: dict[str, str] = {
         "event_id": event.id,
@@ -211,7 +267,7 @@ async def enrich_pr(
         "actor": event.actor,
         "action": event.action,
         "source": "gharchive",
-        "has_api_data": str(bool(pr_data)).lower(),
+        "has_api_data": str(bool(diff)).lower(),
     }
     if event.has_org:
         metadata["has_org"] = "true"
@@ -220,23 +276,23 @@ async def enrich_pr(
         id=event.id,
         repo=event.repository,
         number=event.pull_number,
-        title=pr_data.title if pr_data else event.title,
+        title=event.title,
         body=body_text,
         user=user_login,
-        state=pr_data.state if pr_data else "closed",
-        base_commit=pr_data.base_sha if pr_data else event.base_sha,
-        head_commit=pr_data.head_sha if pr_data else "",
-        merge_commit=event.merge_sha if not pr_data else pr_data.head_sha,
-        base_ref=pr_data.base_ref if pr_data else event.base_ref,
-        head_ref=pr_data.head_ref if pr_data else event.head_ref,
+        state="closed",
+        base_commit=event.base_sha,
+        head_commit="",
+        merge_commit=event.merge_sha,
+        base_ref=event.base_ref,
+        head_ref=event.head_ref,
         created_at=event.created_at,
-        merged_at=pr_data.merged_at if pr_data else event.merged_at,
-        files_changed=pr_data.changed_files if pr_data else len(changed_paths),
+        merged_at=event.merged_at,
+        files_changed=len(changed_paths),
         additions=total_additions,
         deletions=total_deletions,
         changed_files=changed_paths,
         language=language,
-        stars=pr_data.stars if pr_data else event.stars,
+        stars=event.stars,
         is_bot=is_bot(user_login),
         linked_issues=extract_linked_issues(body_text),
         metadata=metadata,

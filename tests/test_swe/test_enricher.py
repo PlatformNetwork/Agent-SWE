@@ -7,15 +7,17 @@ import pytest
 
 from swe_forge.swe.enricher import (
     EnrichedPullRequest,
+    count_additions,
+    count_deletions,
     detect_language,
     enrich_pr,
     enrich_prs_batch,
     extract_linked_issues,
     filter_bots,
     is_bot,
+    parse_files_from_diff,
 )
 from swe_forge.swe.gharchive import GhArchiveEvent
-from swe_forge.swe.github_api import PRFile, PullRequest
 
 
 def make_event(
@@ -43,44 +45,27 @@ def make_event(
     )
 
 
-def make_pr_data(
-    number: int = 123,
-    title: str = "API Title",
-    additions: int = 100,
-    deletions: int = 50,
-    changed_files: int = 3,
-    user_login: str = "testuser",
-    body: str = "API body",
-) -> PullRequest:
-    return PullRequest(
-        number=number,
-        title=title,
-        body=body,
-        state="closed",
-        merged=True,
-        merged_at=datetime(2023, 1, 2, 12, 0, 0, tzinfo=timezone.utc),
-        user_login=user_login,
-        base_sha="abc123",
-        base_ref="main",
-        head_sha="def456",
-        head_ref="feature",
-        additions=additions,
-        deletions=deletions,
-        changed_files=changed_files,
-    )
+def make_diff(
+    files: list[str] | None = None,
+    additions: int = 10,
+    deletions: int = 5,
+) -> str:
+    """Create a mock unified diff for testing."""
+    if files is None:
+        files = ["src/file1.py", "src/file2.py", "tests/test_file.py"]
 
+    diff_lines = []
+    for filepath in files:
+        diff_lines.append(f"diff --git a/{filepath} b/{filepath}")
+        diff_lines.append(f"--- a/{filepath}")
+        diff_lines.append(f"+++ b/{filepath}")
+        diff_lines.append("@@ -1,5 +1,10 @@")
+        for _ in range(additions):
+            diff_lines.append("+added line")
+        for _ in range(deletions):
+            diff_lines.append("-removed line")
 
-def make_pr_files(count: int = 3) -> list[PRFile]:
-    return [
-        PRFile(
-            filename=f"src/file{i}.py" if i < 2 else f"tests/test_file{i}.py",
-            status="modified",
-            additions=50,
-            deletions=25,
-            changes=75,
-        )
-        for i in range(count)
-    ]
+    return "\n".join(diff_lines)
 
 
 class TestIsBot:
@@ -256,45 +241,99 @@ class TestEnrichedPullRequest:
         assert data["number"] == 123
 
 
+class TestParseFilesFromDiff:
+    def test_parses_single_file(self):
+        diff = "diff --git a/src/main.py b/src/main.py\n--- a/src/main.py\n+++ b/src/main.py\n@@ -1,3 +1,4 @@\n+new line"
+        assert parse_files_from_diff(diff) == ["src/main.py"]
+
+    def test_parses_multiple_files(self):
+        diff = """diff --git a/src/main.py b/src/main.py
+--- a/src/main.py
++++ b/src/main.py
+diff --git a/tests/test_main.py b/tests/test_main.py
+--- a/tests/test_main.py
++++ b/tests/test_main.py"""
+        assert parse_files_from_diff(diff) == ["src/main.py", "tests/test_main.py"]
+
+    def test_empty_diff_returns_empty_list(self):
+        assert parse_files_from_diff("") == []
+
+    def test_no_file_headers_returns_empty_list(self):
+        assert parse_files_from_diff("some random content\nno diff headers") == []
+
+
+class TestCountAdditions:
+    def test_counts_added_lines(self):
+        diff = "+line1\n+line2\n+line3\n+++\n+line4"
+        assert count_additions(diff) == 4
+
+    def test_ignores_file_headers(self):
+        diff = "+++ b/file.py\n+line1\n+line2"
+        assert count_additions(diff) == 2
+
+    def test_empty_diff_returns_zero(self):
+        assert count_additions("") == 0
+
+    def test_no_additions_returns_zero(self):
+        diff = "--- a/file.py\n+++ b/file.py\n@@ -1,3 +1,3 @@"
+        assert count_additions(diff) == 0
+
+
+class TestCountDeletions:
+    def test_counts_deleted_lines(self):
+        diff = "-line1\n-line2\n-line3\n---\n-line4"
+        assert count_deletions(diff) == 4
+
+    def test_ignores_file_headers(self):
+        diff = "--- a/file.py\n-line1\n-line2"
+        assert count_deletions(diff) == 2
+
+    def test_empty_diff_returns_zero(self):
+        assert count_deletions("") == 0
+
+    def test_no_deletions_returns_zero(self):
+        diff = "--- a/file.py\n+++ b/file.py\n@@ -1,3 +1,3 @@"
+        assert count_deletions(diff) == 0
+
+
 class TestEnrichPr:
     @pytest.mark.asyncio
     async def test_enrich_success(self):
-        event = make_event()
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(return_value=make_pr_data())
-        client.get_pr_files = AsyncMock(return_value=make_pr_files())
+        event = make_event(title="Test PR")
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(
+            return_value=make_diff(
+                files=["a.py", "b.py", "c.py"], additions=50, deletions=25
+            )
+        )
 
         result = await enrich_pr(event, client)
 
         assert result.repo == "owner/repo"
         assert result.number == 123
-        assert result.title == "API Title"
+        assert result.title == "Test PR"
         assert result.files_changed == 3
         assert result.additions == 150
         assert result.deletions == 75
 
     @pytest.mark.asyncio
-    async def test_enrich_uses_parallel_calls(self):
+    async def test_enrich_uses_single_diff_call(self):
         event = make_event()
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(return_value=make_pr_data())
-        client.get_pr_files = AsyncMock(return_value=make_pr_files())
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(return_value=make_diff())
 
         await enrich_pr(event, client)
 
-        client.get_pr.assert_called_once_with("owner", "repo", 123)
-        client.get_pr_files.assert_called_once_with("owner", "repo", 123)
+        client.get_pr_diff.assert_called_once_with("owner", "repo", 123)
 
     @pytest.mark.asyncio
     async def test_enrich_detects_language(self):
         event = make_event()
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(return_value=make_pr_data())
-        client.get_pr_files = AsyncMock(
-            return_value=[
-                PRFile("main.py", "modified", 10, 5, 15),
-                PRFile("utils.py", "modified", 20, 10, 30),
-            ]
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(
+            return_value=make_diff(
+                files=["main.py", "utils.py"], additions=10, deletions=5
+            )
         )
 
         result = await enrich_pr(event, client)
@@ -304,9 +343,8 @@ class TestEnrichPr:
     async def test_enrich_uses_language_hint(self):
         event = make_event()
         event.language_hint = "go"
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(return_value=make_pr_data())
-        client.get_pr_files = AsyncMock(return_value=[])
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(return_value="")
 
         result = await enrich_pr(event, client)
         assert result.language == "go"
@@ -314,11 +352,8 @@ class TestEnrichPr:
     @pytest.mark.asyncio
     async def test_enrich_detects_bot(self):
         event = make_event(user="dependabot[bot]")
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(
-            return_value=make_pr_data(user_login="dependabot[bot]")
-        )
-        client.get_pr_files = AsyncMock(return_value=[])
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(return_value=make_diff())
 
         result = await enrich_pr(event, client)
         assert result.is_bot is True
@@ -326,11 +361,8 @@ class TestEnrichPr:
     @pytest.mark.asyncio
     async def test_enrich_extracts_linked_issues(self):
         event = make_event(body="This PR fixes #100 and closes #200")
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(
-            return_value=make_pr_data(body="This PR fixes #100 and closes #200")
-        )
-        client.get_pr_files = AsyncMock(return_value=[])
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(return_value=make_diff())
 
         result = await enrich_pr(event, client)
         assert 100 in result.linked_issues
@@ -339,9 +371,8 @@ class TestEnrichPr:
     @pytest.mark.asyncio
     async def test_enrich_fallback_on_api_error(self):
         event = make_event(title="Event Title", body="Event Body")
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(side_effect=Exception("API Error"))
-        client.get_pr_files = AsyncMock(side_effect=Exception("API Error"))
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(side_effect=Exception("API Error"))
 
         result = await enrich_pr(event, client)
 
@@ -350,24 +381,28 @@ class TestEnrichPr:
         assert result.metadata.get("has_api_data") == "false"
 
     @pytest.mark.asyncio
-    async def test_enrich_partial_fallback(self):
-        event = make_event()
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(side_effect=Exception("API Error"))
-        client.get_pr_files = AsyncMock(return_value=make_pr_files())
+    async def test_enrich_uses_event_data(self):
+        event = make_event(
+            title="PR Title from Event",
+            body="PR Body from Event",
+            user="developer",
+        )
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(return_value=make_diff())
 
         result = await enrich_pr(event, client)
 
-        assert result.user == event.user
+        assert result.title == "PR Title from Event"
+        assert result.body == "PR Body from Event"
+        assert result.user == "developer"
 
 
 class TestEnrichPrsBatch:
     @pytest.mark.asyncio
     async def test_batch_enriches_all(self):
         events = [make_event(number=i) for i in range(1, 4)]
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(return_value=make_pr_data())
-        client.get_pr_files = AsyncMock(return_value=make_pr_files())
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(return_value=make_diff())
 
         results = await enrich_prs_batch(events, client, concurrency=5)
 
@@ -379,9 +414,8 @@ class TestEnrichPrsBatch:
     @pytest.mark.asyncio
     async def test_batch_respects_concurrency(self):
         events = [make_event(number=i) for i in range(10)]
-        client = MagicMock(spec=["get_pr", "get_pr_files"])
-        client.get_pr = AsyncMock(return_value=make_pr_data())
-        client.get_pr_files = AsyncMock(return_value=make_pr_files())
+        client = MagicMock(spec=["get_pr_diff"])
+        client.get_pr_diff = AsyncMock(return_value=make_diff())
 
         results = await enrich_prs_batch(events, client, concurrency=2)
 
