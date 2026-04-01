@@ -502,7 +502,10 @@ class GitHubClient:
                 f"Git clone failed: {e.stderr.decode('utf-8', errors='replace') if e.stderr else str(e)}"
             ) from e
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True, timeout=30)
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
 
     @retry(
         retry=retry_if_exception_type(
