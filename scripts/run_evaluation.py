@@ -120,6 +120,13 @@ def run_instance_evaluation(
             result["error"] = "No fail_to_pass tests defined"
             return result
         
+        # Copy generated tests from /workspace/tests/ to /repo/tests/
+        subprocess.run(
+            ["docker", "exec", container_name, "bash", "-c",
+             "mkdir -p /repo/tests && cp -r /workspace/tests/* /repo/tests/ 2>/dev/null || true"],
+            capture_output=True, text=True, timeout=30
+        )
+        
         # Create patch file in container
         patch_path = "/tmp/patch.diff"
         with open(patch_path, "w") as f:
