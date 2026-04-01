@@ -17,6 +17,7 @@ from swe_forge.swe.pipeline import (
     SwePipelineEventType,
 )
 from swe_forge.swe.pr_cache import PRCache
+from swe_forge.swe.ungh_client import UnghRepo
 
 
 @pytest.fixture
@@ -90,6 +91,14 @@ class TestPipelineDedup:
         )
 
         enriched_call_count = 0
+        fetch_count = 0
+
+        async def mock_fetch_batch(hours_start, hours_end):
+            nonlocal fetch_count
+            fetch_count += 1
+            if fetch_count == 1:
+                return [sample_event]
+            return []
 
         async def mock_enrich(event, client):
             nonlocal enriched_call_count
@@ -112,19 +121,36 @@ class TestPipelineDedup:
                 stars=event.stars,
             )
 
-        with patch.object(pipeline, "_fetch_events", return_value=[sample_event]):
-            with patch("swe_forge.swe.pipeline.enrich_pr", mock_enrich):
-                events = []
-                async with pipeline:
-                    async for event in pipeline.run_with_progress():
-                        events.append(event)
+        mock_repo_info = UnghRepo(
+            id=123,
+            name="repo",
+            owner="owner",
+            description="test",
+            stars=1000,
+            default_branch="main",
+            created_at="",
+            updated_at="",
+        )
 
-                assert enriched_call_count == 0
-                final_event = events[-1]
-                assert final_event.event_type == SwePipelineEventType.PIPELINE_COMPLETED
-                metrics = final_event.data.get("metrics")
-                assert metrics is not None
-                assert metrics.duplicates_skipped == 1
+        with patch.object(pipeline, "_fetch_events_batch", mock_fetch_batch):
+            with patch.object(
+                pipeline, "_repo_prefilter_stage", return_value=mock_repo_info
+            ):
+                with patch("swe_forge.swe.pipeline.enrich_pr", mock_enrich):
+                    events = []
+                    async with pipeline:
+                        async for event in pipeline.run_with_progress():
+                            events.append(event)
+
+                    assert enriched_call_count == 0
+                    final_event = events[-1]
+                    assert (
+                        final_event.event_type
+                        == SwePipelineEventType.PIPELINE_COMPLETED
+                    )
+                    metrics = final_event.data.get("metrics")
+                    assert metrics is not None
+                    assert metrics.duplicates_skipped == 1
 
         await pr_cache.close()
 
@@ -173,15 +199,29 @@ class TestPipelineDedup:
         async def mock_extract_patch(enriched):
             return "patch content", ""
 
-        with patch.object(pipeline, "_fetch_events", return_value=[sample_event]):
-            with patch("swe_forge.swe.pipeline.enrich_pr", mock_enrich):
-                with patch.object(pipeline, "_extract_patch", mock_extract_patch):
-                    events = []
-                    async with pipeline:
-                        async for event in pipeline.run_with_progress():
-                            events.append(event)
+        mock_repo_info = UnghRepo(
+            id=123,
+            name="repo",
+            owner="owner",
+            description="test",
+            stars=1000,
+            default_branch="main",
+            created_at="",
+            updated_at="",
+        )
 
-                    assert await pr_cache.is_processed("owner/repo/42")
+        with patch.object(pipeline, "_fetch_events_batch", return_value=[sample_event]):
+            with patch.object(
+                pipeline, "_repo_prefilter_stage", return_value=mock_repo_info
+            ):
+                with patch("swe_forge.swe.pipeline.enrich_pr", mock_enrich):
+                    with patch.object(pipeline, "_extract_patch", mock_extract_patch):
+                        events = []
+                        async with pipeline:
+                            async for event in pipeline.run_with_progress():
+                                events.append(event)
+
+                        assert await pr_cache.is_processed("owner/repo/42")
 
         await pr_cache.close()
 
@@ -216,16 +256,33 @@ class TestPipelineDedup:
                 stars=event.stars,
             )
 
-        with patch.object(pipeline, "_fetch_events", return_value=[sample_event]):
-            with patch("swe_forge.swe.pipeline.enrich_pr", mock_enrich):
-                events = []
-                async with pipeline:
-                    async for event in pipeline.run_with_progress():
-                        events.append(event)
+        mock_repo_info = UnghRepo(
+            id=123,
+            name="repo",
+            owner="owner",
+            description="test",
+            stars=1000,
+            default_branch="main",
+            created_at="",
+            updated_at="",
+        )
 
-                assert len(events) > 0
-                final_event = events[-1]
-                assert final_event.event_type == SwePipelineEventType.PIPELINE_COMPLETED
-                metrics = final_event.data.get("metrics")
-                assert metrics is not None
-                assert metrics.duplicates_skipped == 0
+        with patch.object(pipeline, "_fetch_events_batch", return_value=[sample_event]):
+            with patch.object(
+                pipeline, "_repo_prefilter_stage", return_value=mock_repo_info
+            ):
+                with patch("swe_forge.swe.pipeline.enrich_pr", mock_enrich):
+                    events = []
+                    async with pipeline:
+                        async for event in pipeline.run_with_progress():
+                            events.append(event)
+
+                    assert len(events) > 0
+                    final_event = events[-1]
+                    assert (
+                        final_event.event_type
+                        == SwePipelineEventType.PIPELINE_COMPLETED
+                    )
+                    metrics = final_event.data.get("metrics")
+                    assert metrics is not None
+                    assert metrics.duplicates_skipped == 0

@@ -27,6 +27,7 @@ from .gharchive import GhArchiveClient, GhArchiveEvent
 from .github_api import GitHubClient
 from .models import SweTask, SweTaskStatus
 from .test_generator import GeneratedTests
+from .ungh_client import UnghClient, UnghRepo
 
 from swe_forge.execution.docker_client import DockerClient
 from swe_forge.execution.sandbox import DockerSandbox, SandboxConfig
@@ -110,6 +111,7 @@ class BenchmarkMetrics:
     total_raw_events: int = 0
     total_merged_events: int = 0
     total_prefiltered: int = 0
+    prefilter_rejected: int = 0
     enriched_count: int = 0
     enrichment_failed: int = 0
     filter_passed: int = 0
@@ -186,6 +188,7 @@ class SwePipeline:
         self._filter_config = self._build_filter_config()
         self._active = False
         self._classifier: DifficultyClassifier | None = None
+        self.ungh_client = UnghClient()
 
     def _build_filter_config(self) -> FilterConfig:
         """Build filter config from pipeline config."""
@@ -218,6 +221,7 @@ class SwePipeline:
         """Enter async context manager."""
         if self.gh_archive_client._session is None:
             await self.gh_archive_client._ensure_session()
+        await self.ungh_client.__aenter__()
         self._active = True
         return self
 
@@ -225,6 +229,7 @@ class SwePipeline:
         """Exit async context manager."""
         self._active = False
         await self.gh_archive_client.close()
+        await self.ungh_client.__aexit__(exc_type, exc_val, exc_tb)
 
     async def _create_sandbox(
         self,
@@ -257,6 +262,45 @@ class SwePipeline:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
                 logger.warning("Event queue full, dropping event: %s", event.event_type)
+
+    async def _repo_prefilter_stage(
+        self,
+        event: GhArchiveEvent,
+        metrics: BenchmarkMetrics,
+    ) -> UnghRepo | None:
+        """Prefilter repository using UNgh before expensive GitHub API calls.
+
+        Uses UNgh (no rate limit) to check repository stars/language,
+        filtering out low-quality repos before making any GitHub API calls.
+
+        Args:
+            event: GH Archive event with repository info.
+            metrics: Benchmark metrics to update.
+
+        Returns:
+            UnghRepo if repo passes filters, None if rejected or on error.
+        """
+        try:
+            parts = event.repository.split("/", 1)
+            owner = parts[0]
+            repo = parts[1] if len(parts) > 1 else ""
+
+            repo_info = await self.ungh_client.get_repo(owner, repo)
+
+            if self.config.min_stars and repo_info.stars < self.config.min_stars:
+                logger.debug(
+                    "Prefilter rejected %s - stars %d < %d",
+                    event.repository,
+                    repo_info.stars,
+                    self.config.min_stars,
+                )
+                return None
+
+            return repo_info
+
+        except Exception as e:
+            logger.warning("UNgh failed for %s: %s", event.repository, e)
+            return None
 
     async def _enrich_stage(
         self,
@@ -896,7 +940,11 @@ class SwePipeline:
                         metrics.duplicates_skipped += 1
                         return None
 
-                # EARLY TRIAGE - classify before expensive enrichment
+                repo_info = await self._repo_prefilter_stage(event, metrics)
+                if repo_info is None:
+                    metrics.prefilter_rejected += 1
+                    return None
+
                 early_difficulty = await self._early_triage_stage(
                     event, preclassify_sem, metrics
                 )
