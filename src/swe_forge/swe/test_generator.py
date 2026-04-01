@@ -51,6 +51,17 @@ DEFAULT_TIMEOUT_MS = 60_000
 PRE_APPLY_TIMEOUT_SECONDS = 60  # 60s timeout for pre-apply test validation
 POST_APPLY_TIMEOUT_SECONDS = 60  # 60s timeout for post-apply test validation
 
+KNOWN_REPO_PATTERNS = [
+    "glassflow-api",
+    "pydantic-",
+    "sgl-project",
+    "rust-skia",
+    "python/cpython",
+    "microsoft/",
+    "google/",
+    "facebook/",
+]
+
 
 def _get_progressive_hint(error_type: str, retry_count: int) -> str:
     """Get progressive hint based on retry count and error type.
@@ -536,6 +547,119 @@ def validate_test_scripts(files: list[TestFile]) -> str | None:
     return "Test script validation issues:\n- " + "\n- ".join(issues)
 
 
+def validate_test_path(
+    path: str,
+    task_repo: str,
+    language: str = "python",
+) -> tuple[bool, str]:
+    """Validate that test file path is safe and matches task context.
+
+    Args:
+        path: Path the agent wants to write to.
+        task_repo: The repository being processed (e.g., 'pydantic/pydantic').
+        language: Repository language.
+
+    Returns:
+        Tuple of (is_valid, error_message).
+        If is_valid is False, error_message explains why.
+    """
+    if not path:
+        return (False, "Path cannot be empty")
+
+    path_lower = path.lower()
+    import os
+
+    basename = os.path.basename(path_lower)
+    is_test_file = (
+        path_lower.startswith("tests/")
+        or path_lower.startswith("test/")
+        or "/tests/" in path_lower
+        or basename.startswith("test")
+        or basename.endswith("_test.py")
+        or basename.endswith("_test.js")
+        or basename.endswith("_test.ts")
+    )
+    if not is_test_file:
+        return (
+            False,
+            f"Invalid path '{path}': test files must be in tests/ directory or start with 'test'",
+        )
+
+    for repo_pattern in KNOWN_REPO_PATTERNS:
+        if repo_pattern in path and repo_pattern not in task_repo:
+            return (
+                False,
+                f"Path '{path}' contains external repository reference '{repo_pattern}'. "
+                f"Cross-contamination detected - this path is from a different repository.",
+            )
+
+    if path.startswith("/"):
+        return (False, f"Path '{path}' is absolute - must be relative to workspace")
+
+    if ".." in path:
+        return (False, f"Path '{path}' contains '..' - path traversal not allowed")
+
+    if language == "python" and not path.endswith(".py"):
+        return (
+            False,
+            f"Path '{path}' missing .py extension for Python repository",
+        )
+
+    return (True, "")
+
+
+def is_valid_test_content(content: str, language: str) -> tuple[bool, str]:
+    """Validate test content matches expected language patterns.
+
+    Args:
+        content: Test file content.
+        language: Expected language.
+
+    Returns:
+        Tuple of (is_valid, error_message).
+    """
+    if not content or not content.strip():
+        return (False, "Test content is empty")
+
+    content_lower = content.lower()
+
+    if language not in ("go", "golang"):
+        if "package " in content and "func Test" in content:
+            return (
+                False,
+                "Go test patterns (package/func Test) found in non-Go repository",
+            )
+        if "testing.T" in content:
+            return (
+                False,
+                "Go testing.T pattern found in non-Go repository",
+            )
+
+    if language == "python":
+        has_import = "import " in content
+        has_def_test = "def test_" in content or "def test" in content_lower
+        has_class_test = "class test" in content_lower or "class Test" in content
+
+        if not (has_import or has_def_test or has_class_test):
+            return (
+                False,
+                "Python test must contain 'import', 'def test_', or 'class Test'",
+            )
+
+    elif language in ["javascript", "typescript", "js", "ts"]:
+        has_describe = "describe(" in content or "describe." in content
+        has_it = "it(" in content or "test(" in content
+        has_expect = "expect(" in content
+
+        if not (has_describe or has_it or has_expect):
+            return (
+                False,
+                "JavaScript test must contain 'describe', 'it(', or 'expect('",
+            )
+
+    return (True, "")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TestGenerator Class
 # ─────────────────────────────────────────────────────────────────────────────
@@ -800,7 +924,12 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
                     pass
 
     async def _handle_write_file(
-        self, arguments: dict[str, Any], sandbox: SandboxProtocol
+        self,
+        arguments: dict[str, Any],
+        sandbox: SandboxProtocol,
+        *,
+        task_repo: str = "",
+        language: str = "python",
     ) -> ToolResult:
         """Handle write_file tool call."""
         path = arguments.get("path", "")
@@ -809,10 +938,17 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
         if not path:
             return ToolResult(content="Error: missing path parameter", is_error=True)
 
+        is_valid, error_msg = validate_test_path(path, task_repo, language)
+        if not is_valid:
+            return ToolResult(content=f"Error: {error_msg}", is_error=True)
+
+        is_valid_content, content_error = is_valid_test_content(content, language)
+        if not is_valid_content:
+            return ToolResult(content=f"Error: {content_error}", is_error=True)
+
         try:
             await sandbox.write_file(path, content)
 
-            # Track written files
             for existing in self._written_files:
                 if existing.path == path:
                     existing.content = content
@@ -884,7 +1020,12 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
                 )
 
         elif tool_name == "write_file":
-            return await self._handle_write_file(arguments, sandbox)
+            return await self._handle_write_file(
+                arguments,
+                sandbox,
+                task_repo=self._task.repo if self._task else "",
+                language=self._task.language if self._task else "python",
+            )
 
         elif tool_name == "read_file":
             return await self._handle_read_file(arguments, sandbox)
