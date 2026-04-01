@@ -46,9 +46,79 @@ MAX_AGENT_TURNS = 400
 
 # ContextVar for per-async-task dataset_prompt isolation
 _dataset_prompt_var: ContextVar[str] = ContextVar("dataset_prompt", default="")
-MAX_VALIDATION_RETRIES = 3
+MAX_VALIDATION_RETRIES = 10
 DEFAULT_TIMEOUT_MS = 60_000
 PRE_APPLY_TIMEOUT_SECONDS = 60  # 60s timeout for pre-apply test validation
+POST_APPLY_TIMEOUT_SECONDS = 60  # 60s timeout for post-apply test validation
+
+
+def _get_progressive_hint(error_type: str, retry_count: int) -> str:
+    """Get progressive hint based on retry count and error type.
+
+    Tier 1 (1-3 retries): Generic guidance
+    Tier 2 (4-6 retries): Specific hints based on error type
+    Tier 3 (7-10 retries): Simplification suggestions
+
+    Args:
+        error_type: Type of error encountered
+        retry_count: Current retry attempt number
+
+    Returns:
+        Progressive hint message
+    """
+    # Tier 3: Simplification hints (7-10 retries)
+    if retry_count > 6:
+        return (
+            "STRUGGLING? Try a SIMPLER test approach:\n"
+            "• Import the module and call the function directly\n"
+            "• Check basic input/output behavior\n"
+            "• Focus on ONE specific bug behavior\n"
+            "• Avoid complex setup or dependencies"
+        )
+
+    # Tier 2: Specific hints based on error type (4-6 retries)
+    if retry_count > 3:
+        if "string-matching" in error_type.lower():
+            return (
+                "STRING-MATCHING REJECTED: Do NOT read source files!\n"
+                "• Import the module with 'import package.module'\n"
+                "• Call functions and check return values\n"
+                "• Use assert result == expected, NOT assert 'code' in file_content"
+            )
+        elif "passed on base" in error_type.lower() or "pass" in error_type.lower():
+            return (
+                "TEST PASSES ON BASE: This doesn't test the bug!\n"
+                "• The test MUST fail before the patch is applied\n"
+                "• Check that you're testing the exact bug scenario\n"
+                "• Ensure the test actually exercises the buggy code path"
+            )
+        elif "failed after patch" in error_type.lower():
+            return (
+                "TEST FAILS AFTER PATCH: Patch doesn't fix this behavior!\n"
+                "• Your test may be checking unrelated behavior\n"
+                "• Verify the patch actually changes what you're testing\n"
+                "• Focus on testing the specific change in the patch"
+            )
+        elif "timeout" in error_type.lower():
+            return (
+                "TEST TIMEOUT: Test takes too long!\n"
+                "• Use smaller test cases or inputs\n"
+                "• Mock slow operations if needed\n"
+                "• Focus on unit tests, not integration tests"
+            )
+        else:
+            return (
+                "VALIDATION FAILED: Check your test approach:\n"
+                "• Verify imports work correctly\n"
+                "• Ensure test commands are appropriate for the language\n"
+                "• Check that test files are in the correct location"
+            )
+
+    # Tier 1: Generic hints (1-3 retries)
+    return (
+        "Check your test structure and imports. "
+        "Ensure tests follow best practices for the language and test framework."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +145,46 @@ PROCESS:
 IMPORTANT:
 - Tests that always pass are INVALID (don't test the bug)
 - Tests that always fail are INVALID (wrong behavior expected)
-- You MUST run tests at least once before and after patch"""
+- You MUST run tests at least once before and after patch
+
+## FEW-SHOT EXAMPLES
+
+### Example 1: Python pytest - API Response Storage Bug
+# Bug: Responses with store=False were incorrectly retrievable
+def test_store_false_not_retrievable():
+    # FAILS before patch, PASSES after
+    stream = client.create(input="Hello", store=False)
+    response_id = next(c.id for c in stream if c.type == "created")
+    with pytest.raises(Exception):  # BUG: was retrievable
+        client.retrieve(response_id)
+
+### Example 2: Python pytest - Config Defaults Override Bug  
+# Bug: Defaults overrode explicit config values
+def test_explicit_values_preserved():
+    # FAILS before patch, PASSES after
+    cfg = Config(timeout=30)  # explicit value
+    cfg.apply_defaults(Defaults(timeout=60))
+    assert cfg.timeout == 30  # BUG: returned 60
+
+### Example 3: TypeScript Jest - State Not Rendering Bug
+// Bug: UI state updates weren't reflecting in renders
+it('updates name after edit', async () => {
+    // FAILS before patch, PASSES after
+    render(<Profile name="Alice" />);
+    await user.click(screen.getByText('Edit'));
+    await user.type(screen.getByLabelText('Name'), 'Bob');
+    await screen.findByText('Bob');  // BUG: showed "Alice"
+});
+
+### Example 4: TypeScript Jest - Validation Not Showing Bug
+// Bug: Error message not displayed for invalid input
+it('shows error for duplicate email', async () => {
+    // FAILS before patch, PASSES after
+    render(<RegisterForm validateEmail={mockReject} />);
+    await user.type(screen.getByLabelText('Email'), 'dup@test.com');
+    await screen.findByText('Already registered');  // BUG: no error
+});
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -479,6 +588,8 @@ class TestGenerator:
         self._max_tokens = max_tokens
         self._max_context_tokens = max_context_tokens
         self._written_files: list[TestFile] = []
+        self._task: Any = None
+        self._validation_retry_count: int = 0
 
     def _get_tools(self) -> list[ToolDefinition]:
         """Get all tool schemas for the agent."""
@@ -508,11 +619,17 @@ class TestGenerator:
 
     def _build_user_message(self, task: SweTask) -> str:
         """Build the initial user message for the agent."""
-        return f"""{task.repo}
+        return f"""## Repository
+- Repo: {task.repo}
+- Language: {task.language}
 
-{self._truncate(task.patch, 4000)}
+## Bug Description
+{task.prompt or "No description provided"}
 
-Use set_dataset_prompt first, then write tests."""
+## Patch (Changes Made)
+{self._truncate(task.patch, 8000)}
+
+Generate tests that FAIL on this bug and PASS after applying the patch."""
 
     def _test_commands_for_language(self, language: str) -> tuple[list[str], list[str]]:
         """Get suggested build and test commands for a language.
@@ -603,6 +720,84 @@ Use set_dataset_prompt first, then write tests."""
                 return False, f"Failed to run test '{test_cmd[:50]}': {e}"
 
         return True, ""
+
+    async def _validate_post_apply(
+        self, tests: list[str], patch: str, sandbox: SandboxProtocol
+    ) -> tuple[bool, str]:
+        """Validate that tests PASS after the patch is applied.
+
+        This ensures the tests correctly test that the bug is fixed by the patch.
+
+        Args:
+            tests: List of test commands to validate.
+            patch: The patch content to apply.
+            sandbox: Sandbox for running tests.
+
+        Returns:
+            Tuple of (valid, error_message). valid=True if tests pass as expected.
+        """
+        if not tests:
+            return False, "No tests to validate"
+
+        if not patch:
+            return False, "No patch provided for post-apply validation"
+
+        applied = False
+        try:
+            await sandbox.write_file(".swe_forge_post_apply_patch.tmp", patch)
+            result = await sandbox.run_command(
+                "git apply --allow-empty .swe_forge_post_apply_patch.tmp"
+            )
+            if result.exit_code != 0:
+                return False, f"Failed to apply patch: {result.stdout}"
+            applied = True
+
+            for test_cmd in tests:
+                try:
+                    args = ShellArgs(
+                        command=test_cmd,
+                        timeout_ms=POST_APPLY_TIMEOUT_SECONDS * 1000,
+                    )
+                    result = await asyncio.wait_for(
+                        self._execute_shell(args, sandbox),
+                        timeout=POST_APPLY_TIMEOUT_SECONDS + 10,
+                    )
+
+                    if result.is_error:
+                        display_cmd = (
+                            test_cmd if len(test_cmd) <= 50 else test_cmd[:47] + "..."
+                        )
+                        return False, (
+                            f"Test '{display_cmd}' FAILED after patch. "
+                            "Tests must PASS after the patch is applied. "
+                            "The patch should fix the bug being tested."
+                        )
+                except asyncio.TimeoutError:
+                    display_cmd = (
+                        test_cmd if len(test_cmd) <= 50 else test_cmd[:47] + "..."
+                    )
+                    logger.warning(
+                        f"Post-apply test timed out after {POST_APPLY_TIMEOUT_SECONDS}s: {display_cmd}"
+                    )
+                    return False, (
+                        f"TIMEOUT: Test '{display_cmd}' exceeded {POST_APPLY_TIMEOUT_SECONDS}s. "
+                        "Consider simpler test approach or reduce test scope."
+                    )
+                except Exception as e:
+                    return False, f"Failed to run test '{test_cmd[:50]}': {e}"
+
+            return True, ""
+
+        finally:
+            if applied:
+                try:
+                    await sandbox.run_command("git checkout .")
+                except Exception:
+                    pass
+                try:
+                    await sandbox.run_command("rm -f .swe_forge_post_apply_patch.tmp")
+                except Exception:
+                    pass
 
     async def _handle_write_file(
         self, arguments: dict[str, Any], sandbox: SandboxProtocol
@@ -770,15 +965,30 @@ Use set_dataset_prompt first, then write tests."""
         test_files_raw = arguments.get("test_files", [])
         install_commands = arguments.get("install_commands", [])
 
+        self._validation_retry_count += 1
+
         # Pre-apply validation: tests must FAIL on base commit
         valid, error = await self._validate_pre_apply(fail_to_pass, sandbox)
         if not valid:
+            hint = _get_progressive_hint("PASSED on base", self._validation_retry_count)
             return ToolResult(
-                content=f"PRE-APPLY VALIDATION FAILED: {error}\n\n"
-                "Rewrite tests to properly test the bug behavior. "
-                "Tests must FAIL on base commit, then PASS after the patch is applied.",
+                content=f"PRE-APPLY VALIDATION FAILED: {error}\n\n{hint}",
                 is_error=True,
             )
+
+        # Post-apply validation: tests must PASS after patch
+        if self._task and hasattr(self._task, "patch") and self._task.patch:
+            valid, error = await self._validate_post_apply(
+                fail_to_pass, self._task.patch, sandbox
+            )
+            if not valid:
+                hint = _get_progressive_hint(
+                    "FAILED after patch", self._validation_retry_count
+                )
+                return ToolResult(
+                    content=f"POST-APPLY VALIDATION FAILED: {error}\n\n{hint}",
+                    is_error=True,
+                )
 
         # Parse test files
         test_files: list[TestFile] = []
@@ -829,6 +1039,8 @@ Use set_dataset_prompt first, then write tests."""
             max_context_tokens=self._max_context_tokens,
         )
         self._written_files = []
+        self._task = task
+        self._validation_retry_count = 0
         _dataset_prompt_var.set("")  # Reset for each async task
         validation_retries = 0
 

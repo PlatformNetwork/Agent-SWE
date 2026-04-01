@@ -265,13 +265,19 @@ class MockSandbox:
         self.files: dict[str, str] = {}
         self.commands: list[tuple[str, float | None]] = []
         self.test_exit_code = test_exit_code
+        self._patch_applied = False
 
     async def run_command(self, cmd: str, *, timeout: float | None = None):
         self.commands.append((cmd, timeout))
+        if "git apply" in cmd:
+            self._patch_applied = True
+            return MockExecResult(stdout="output", stderr="", exit_code=0)
+        if "git checkout" in cmd:
+            self._patch_applied = False
+            return MockExecResult(stdout="output", stderr="", exit_code=0)
         if "pytest" in cmd or "npm test" in cmd or "cargo test" in cmd:
-            return MockExecResult(
-                stdout="output", stderr="", exit_code=self.test_exit_code
-            )
+            exit_code = 0 if self._patch_applied else self.test_exit_code
+            return MockExecResult(stdout="output", stderr="", exit_code=exit_code)
         return MockExecResult(stdout="output", stderr="", exit_code=0)
 
     async def write_file(self, path: str, content: str):
@@ -659,7 +665,7 @@ class TestConstants:
         assert MAX_AGENT_TURNS == 400
 
     def test_max_validation_retries(self):
-        assert MAX_VALIDATION_RETRIES == 3
+        assert MAX_VALIDATION_RETRIES == 10
 
 
 class TestPreApplyValidation:
