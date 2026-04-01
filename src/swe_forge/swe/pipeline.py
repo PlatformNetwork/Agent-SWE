@@ -120,6 +120,12 @@ class BenchmarkMetrics:
     preclassify_medium: int = 0
     preclassify_hard: int = 0
     duplicates_skipped: int = 0
+    early_triage_count: int = 0
+    early_triage_easy: int = 0
+    early_triage_medium: int = 0
+    early_triage_hard: int = 0
+    early_triage_skip_count: int = 0
+    early_triage_error_count: int = 0
     extraction_attempted: int = 0
     extraction_succeeded: int = 0
     extraction_failed: int = 0
@@ -325,6 +331,76 @@ class SwePipeline:
                 difficulty,
             )
             return difficulty
+
+    async def _early_triage_stage(
+        self,
+        event: GhArchiveEvent,
+        semaphore: asyncio.Semaphore,
+        metrics: BenchmarkMetrics,
+    ) -> str | None:
+        """Early triage stage: classify difficulty before enrichment.
+
+        Uses only PR title and body for fast, cheap triage before expensive
+        enrichment and deep processing.
+
+        Args:
+            event: GH Archive event with PR metadata.
+            semaphore: Concurrency limiter for LLM calls.
+            metrics: Benchmark metrics to update.
+
+        Returns:
+            Difficulty string ("easy", "medium", "hard") or None on skip/error.
+        """
+        # Conservative: skip if missing title or body
+        if not event.title or not event.body:
+            metrics.early_triage_skip_count += 1
+            logger.debug(
+                "Skipping early triage for %s#%d - missing title/body",
+                event.repository,
+                event.pull_number,
+            )
+            return None
+
+        async with semaphore:
+            metrics.early_triage_count += 1
+
+            try:
+                classifier = self._get_classifier()
+                if classifier is None:
+                    logger.warning(
+                        "No classifier for %s#%d, skipping early triage",
+                        event.repository,
+                        event.pull_number,
+                    )
+                    return None
+
+                pr_info = PRInfo(title=event.title, body=event.body or "")
+                response: TriageResponse = await classifier.classify_triage(pr_info)
+                difficulty = response.difficulty
+
+                if difficulty == "easy":
+                    metrics.early_triage_easy += 1
+                elif difficulty == "medium":
+                    metrics.early_triage_medium += 1
+                else:
+                    metrics.early_triage_hard += 1
+
+                logger.debug(
+                    "Early triaged %s#%d as %s",
+                    event.repository,
+                    event.pull_number,
+                    difficulty,
+                )
+                return difficulty
+
+            except Exception:
+                metrics.early_triage_error_count += 1
+                logger.exception(
+                    "Error during early triage for %s#%d",
+                    event.repository,
+                    event.pull_number,
+                )
+                return None
 
     async def _deep_stage(
         self,
@@ -820,6 +896,19 @@ class SwePipeline:
                         metrics.duplicates_skipped += 1
                         return None
 
+                # EARLY TRIAGE - classify before expensive enrichment
+                early_difficulty = await self._early_triage_stage(
+                    event, preclassify_sem, metrics
+                )
+                if early_difficulty == "easy":
+                    metrics.early_triage_skip_count += 1
+                    logger.info(
+                        "Skipping easy PR %s#%d (early triage)",
+                        event.repository,
+                        event.pull_number,
+                    )
+                    return None
+
                 enriched = await self._enrich_stage(event, enrich_sem, metrics)
                 if enriched is None:
                     return None
@@ -861,9 +950,12 @@ class SwePipeline:
                     elif completed_count >= self.config.max_tasks:
                         return None
 
-                difficulty = await self._preclassify_stage(
-                    enriched, preclassify_sem, metrics
-                )
+                # Use early triage result if available, otherwise classify after enrichment
+                difficulty = early_difficulty
+                if difficulty is None:
+                    difficulty = await self._preclassify_stage(
+                        enriched, preclassify_sem, metrics
+                    )
 
                 if not self._difficulty_matches_filter(difficulty, self.config):
                     logger.debug(
