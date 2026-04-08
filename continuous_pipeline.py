@@ -87,7 +87,7 @@ def build_and_push_docker(task_dir: Path) -> bool:
             logger.warning("No OPENROUTER_API_KEY, skipping Docker for %s", task_id)
             return False
 
-        model = os.environ.get("LLM_MODEL", "openai/gpt-5.4")
+        model = os.environ.get("LLM_MODEL", "moonshotai/kimi-k2.5:nitro")
         llm_client = OpenRouterClient(api_key=openrouter_key, default_model=model)
         agent = DockerSetupAgent(llm_client, model=model, max_turns=100)
 

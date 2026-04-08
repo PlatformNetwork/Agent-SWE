@@ -176,7 +176,7 @@ class ComplexityEvaluator:
     
     def __init__(
         self,
-        model: str = "openai/gpt-5.4",
+        model: str = "moonshotai/kimi-k2.5:nitro",
         api_key: str | None = None,
         api_base: str = "https://openrouter.ai/api/v1"
     ):

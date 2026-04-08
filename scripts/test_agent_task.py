@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
-MODEL = "openai/gpt-5.4"
+MODEL = "moonshotai/kimi-k2.5:nitro"
 API_BASE = "https://openrouter.ai/api/v1"
 
 

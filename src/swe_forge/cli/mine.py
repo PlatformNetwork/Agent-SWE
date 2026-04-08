@@ -121,7 +121,7 @@ def mine(
             "-m",
             help="LLM model for classification",
         ),
-    ] = "openai/gpt-5.4",
+    ] = "moonshotai/kimi-k2.5:nitro",
     once: Annotated[
         bool,
         typer.Option(
@@ -466,7 +466,7 @@ async def _build_and_verify_task(
     push: bool = False,
     max_repair: int = 5,
     llm_client: "OpenRouterClient | None" = None,
-    model: str = "openai/gpt-5.4",
+    model: str = "moonshotai/kimi-k2.5:nitro",
 ) -> bool:
     """Build Docker image, verify with repair loop, optionally push.
 
@@ -534,7 +534,7 @@ async def _run_pipeline(
     config: SwePipelineConfig,
     repo_filter: Optional[str],
     verbose: bool,
-    model: str = "openai/gpt-5.4",
+    model: str = "moonshotai/kimi-k2.5:nitro",
     *,
     skip_duplicates: bool = False,
     hf_dataset: Optional[str] = None,
@@ -713,7 +713,7 @@ def mine_complete(
             "-m",
             help="LLM model for test generation",
         ),
-    ] = "openai/gpt-5.4",
+    ] = "moonshotai/kimi-k2.5:nitro",
     verbose: Annotated[
         bool,
         typer.Option(

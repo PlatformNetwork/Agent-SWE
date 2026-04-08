@@ -257,7 +257,7 @@ Output ONLY a JSON object:
 async def assess_prompt_quality(
     llm: LLMClient,
     prompt: str,
-    model: str = "moonshotai/kimi-k2.5",
+    model: str = "moonshotai/kimi-k2.5:nitro",
 ) -> tuple[float, str, list[str]]:
     """Assess prompt quality using LLM with examples.
 
@@ -378,7 +378,7 @@ async def assess_test_coverage(
     llm: LLMClient,
     fail_to_pass: list[str],
     pass_to_pass: list[str],
-    model: str = "moonshotai/kimi-k2.5",
+    model: str = "moonshotai/kimi-k2.5:nitro",
 ) -> tuple[float, str, list[str]]:
     """Assess test coverage quality.
 
@@ -536,7 +536,7 @@ class TaskScorer:
     def __init__(
         self,
         llm: LLMClient | None = None,
-        model: str = "moonshotai/kimi-k2.5",
+        model: str = "moonshotai/kimi-k2.5:nitro",
         config: ScoringConfig | None = None,
     ):
         self.llm = llm

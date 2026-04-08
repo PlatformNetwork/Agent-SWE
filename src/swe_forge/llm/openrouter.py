@@ -129,7 +129,7 @@ class OpenRouterClient(LLMClient):
 
         body: dict[str, Any] = {
             "model": model,
-            "messages": [msg.model_dump() for msg in request.messages],
+            "messages": [msg.model_dump(exclude_none=True) for msg in request.messages],
         }
 
         if request.temperature is not None:

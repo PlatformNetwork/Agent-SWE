@@ -97,7 +97,7 @@ class CompleteMiningPipeline:
         llm_client: LLMClient | None = None,
         docker_client: DockerClient | None = None,
         *,
-        model: str = "openai/gpt-5.4",
+        model: str = "moonshotai/kimi-k2.5:nitro",
         max_test_turns: int = 200,
         test_timeout: float = 600.0,
         install_timeout: float = 300.0,
