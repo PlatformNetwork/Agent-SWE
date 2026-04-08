@@ -134,7 +134,7 @@ def _bind_mock_sandbox(pipeline: SwePipeline, mock_sandbox: MockSandbox):
     async function that returns the mock.
     """
 
-    async def create_sandbox_async(self, repo_url: str, base_commit: str):
+    async def create_sandbox_async(self, repo_url: str, base_commit: str, *, language: str = ""):
         return mock_sandbox
 
     pipeline._create_sandbox = create_sandbox_async.__get__(pipeline, type(pipeline))
@@ -174,6 +174,7 @@ class TestGeneratorCalledWhenConfigured:
         metrics = BenchmarkMetrics()
         mock_sandbox = MockSandbox()
         _bind_mock_sandbox(pipeline, mock_sandbox)
+        pipeline._validate_in_clean_sandbox = AsyncMock(return_value=True)
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
@@ -252,15 +253,18 @@ class TestGeneratorResultsMappedToTask:
         metrics = BenchmarkMetrics()
         mock_sandbox = MockSandbox()
         _bind_mock_sandbox(pipeline, mock_sandbox)
+        pipeline._validate_in_clean_sandbox = AsyncMock(return_value=True)
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
         assert task.fail_to_pass == ["pytest tests/test_main.py::test_bug_fix"]
         assert task.pass_to_pass == ["pytest tests/test_other.py"]
 
-        assert "tests/test_new.py" in task.test_patch
-        assert "tests/test_extra.py" in task.test_patch
-        assert "def test_new_feature" in task.test_patch
+        # Test files now stored in generated_test_files, not test_patch
+        assert len(task.generated_test_files) == 2
+        paths = [tf["path"] for tf in task.generated_test_files]
+        assert "tests/test_new.py" in paths
+        assert "tests/test_extra.py" in paths
 
         assert "install_commands" in task.install_config
         assert "pip install -e ." in task.install_config["install_commands"]
@@ -317,6 +321,7 @@ class TestGeneratorResultsMappedToTask:
         metrics = BenchmarkMetrics()
         mock_sandbox = MockSandbox()
         _bind_mock_sandbox(pipeline, mock_sandbox)
+        pipeline._validate_in_clean_sandbox = AsyncMock(return_value=True)
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
@@ -367,6 +372,7 @@ class TestGeneratorResultsMappedToTask:
         metrics = BenchmarkMetrics()
         mock_sandbox = MockSandbox()
         _bind_mock_sandbox(pipeline, mock_sandbox)
+        pipeline._validate_in_clean_sandbox = AsyncMock(return_value=True)
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
@@ -477,6 +483,7 @@ class TestEventEmission:
         event_queue: asyncio.Queue[SwePipelineEvent] = asyncio.Queue()
         mock_sandbox = MockSandbox()
         _bind_mock_sandbox(pipeline, mock_sandbox)
+        pipeline._validate_in_clean_sandbox = AsyncMock(return_value=True)
 
         await pipeline._run_test_generation(
             sample_enriched_pr, task, metrics, event_queue
@@ -526,6 +533,7 @@ class TestInstallConfigMapping:
         metrics = BenchmarkMetrics()
         mock_sandbox = MockSandbox()
         _bind_mock_sandbox(pipeline, mock_sandbox)
+        pipeline._validate_in_clean_sandbox = AsyncMock(return_value=True)
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
@@ -572,12 +580,16 @@ class TestTestFilesMerged:
         metrics = BenchmarkMetrics()
         mock_sandbox = MockSandbox()
         _bind_mock_sandbox(pipeline, mock_sandbox)
+        pipeline._validate_in_clean_sandbox = AsyncMock(return_value=True)
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
+        # Original test_patch is preserved unchanged
         assert "# Original test patch" in task.test_patch
-        assert "tests/test_feature.py" in task.test_patch
-        assert "def test_feature" in task.test_patch
+        # Test files now stored in generated_test_files, not test_patch
+        assert len(task.generated_test_files) == 1
+        assert task.generated_test_files[0]["path"] == "tests/test_feature.py"
+        assert "def test_feature" in task.generated_test_files[0]["content"]
 
     @pytest.mark.asyncio
     async def test_test_files_creates_test_patch_if_empty(
@@ -615,8 +627,11 @@ class TestTestFilesMerged:
         metrics = BenchmarkMetrics()
         mock_sandbox = MockSandbox()
         _bind_mock_sandbox(pipeline, mock_sandbox)
+        pipeline._validate_in_clean_sandbox = AsyncMock(return_value=True)
 
         await pipeline._run_test_generation(sample_enriched_pr, task, metrics, None)
 
-        assert "tests/test_new.py" in task.test_patch
-        assert "def test_new" in task.test_patch
+        # Test files now stored in generated_test_files, not test_patch
+        assert len(task.generated_test_files) == 1
+        assert task.generated_test_files[0]["path"] == "tests/test_new.py"
+        assert "def test_new" in task.generated_test_files[0]["content"]

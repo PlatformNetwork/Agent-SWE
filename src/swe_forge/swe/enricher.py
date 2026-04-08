@@ -9,7 +9,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from .gharchive import GhArchiveEvent
-from .github_api import DiffTooLargeError, GitHubClient
+from .github_api import GitHubClient
 
 logger = logging.getLogger(__name__)
 
@@ -245,36 +245,69 @@ async def enrich_pr(
     repo_name = parts[1] if len(parts) > 1 else ""
 
     diff: str | None = None
-
+    # Try sparse fetch first (preserves rate limit)
     try:
-        diff = await github_client.get_pr_diff(owner, repo_name, event.pull_number)
-    except DiffTooLargeError:
-        logger.info(
-            f"Diff too large for {event.repository}#{event.pull_number}, using git clone fallback"
+        diff = await github_client.get_pr_diff_via_sparse_fetch(
+            owner, repo_name, event.pull_number, event.base_sha
         )
-        try:
-            diff = await github_client.get_pr_diff_via_git(
-                owner, repo_name, event.pull_number
-            )
-        except Exception as git_err:
-            logger.warning(
-                f"Git clone fallback also failed for {event.repository}#{event.pull_number}: {git_err}"
-            )
-    except Exception as e:
-        logger.warning(
-            f"GitHub API failed for {event.repository}#{event.pull_number}: {e}"
+        logger.info(f"sparse_fetch_used: {event.repository}#{event.pull_number}")
+    except Exception as sparse_error:
+        logger.warning(f"sparse_fetch_failed: {event.repository}#{event.pull_number} error={sparse_error}")
+        
+        # Fallback to API compare (consumes rate limit)
+        diff = await github_client.get_pr_diff_via_api_compare(
+            owner, repo_name, event.base_sha, event.head_sha
         )
+        
+        if diff is not None:
+            logger.info(f"api_compare_used: {event.repository}#{event.pull_number}")
+        else:
+            # Last resort: old clone method
+            logger.warning(f"falling_back_to_clone: {event.repository}#{event.pull_number}")
+            try:
+                diff = await github_client.get_pr_diff_via_git(
+                    owner, repo_name, event.pull_number
+                )
+            except Exception as clone_error:
+                logger.error(f"git_clone_failed: {event.repository}#{event.pull_number} error={clone_error}")
+                diff = None
 
     changed_paths = parse_files_from_diff(diff) if diff else []
     total_additions = count_additions(diff) if diff else 0
     total_deletions = count_deletions(diff) if diff else 0
 
-    language = detect_language(changed_paths)
-    if language == "unknown" and event.language_hint:
+    # language_hint from GH Archive is the repo's dominant language (reliable)
+    # File-based detection is only used as fallback
+    CONFIG_LANGS = {"xml", "json", "yaml", "toml", "markdown", "html", "css",
+                    "scss", "sass", "less", "restructuredtext", "asciidoc", "lockfile"}
+    file_lang = detect_language(changed_paths)
+    if event.language_hint:
         language = event.language_hint
+    elif file_lang not in CONFIG_LANGS:
+        language = file_lang
+    else:
+        language = file_lang
+
+    # Fetch PR title/body from API if missing from GH Archive
+    pr_title = event.title
+    pr_body = event.body or ""
+    if not pr_title or pr_title == "Untitled change":
+        try:
+            pr_data = await asyncio.wait_for(
+                github_client.get_pr(owner, repo_name, event.pull_number),
+                timeout=30,
+            )
+            pr_title = pr_data.title or pr_title
+            if not pr_body and pr_data.body:
+                pr_body = pr_data.body
+            if not event.merge_sha and pr_data.head_sha:
+                event.merge_sha = pr_data.head_sha
+            logger.info(f"Fetched PR metadata: {event.repository}#{event.pull_number} title={pr_title!r:.60}")
+        except Exception as e:
+            logger.debug(f"Could not fetch PR metadata for {event.repository}#{event.pull_number}: {e}")
 
     user_login = event.user
-    body_text = event.body or ""
+    body_text = pr_body
 
     metadata: dict[str, str] = {
         "event_id": event.id,
@@ -287,17 +320,17 @@ async def enrich_pr(
     if event.has_org:
         metadata["has_org"] = "true"
 
-    return EnrichedPullRequest(
+    enriched_pr = EnrichedPullRequest(
         id=event.id,
         repo=event.repository,
         number=event.pull_number,
-        title=event.title,
+        title=pr_title,
         body=body_text,
         user=user_login,
         state="closed",
         base_commit=event.base_sha,
-        head_commit="",
-        merge_commit=event.merge_sha,
+        head_commit=event.head_sha,
+        merge_commit=event.merge_sha or event.head_sha,
         base_ref=event.base_ref,
         head_ref=event.head_ref,
         created_at=event.created_at,
@@ -313,6 +346,13 @@ async def enrich_pr(
         metadata=metadata,
         diff=diff or "",
     )
+
+    logger.info(
+        f"Enriched {event.repository}#{event.pull_number}: "
+        f"files={len(changed_paths)} lang={language} stars={event.stars}"
+    )
+
+    return enriched_pr
 
 
 async def enrich_prs_batch(

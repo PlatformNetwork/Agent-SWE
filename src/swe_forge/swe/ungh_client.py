@@ -1,5 +1,6 @@
 """UNgh API client for unlimited GitHub access."""
 
+import asyncio
 import aiohttp
 from typing import Optional
 from dataclasses import dataclass
@@ -34,14 +35,21 @@ class UnghFile:
 class UnghClient:
     """Async client for UNgh API (unlimited GitHub access)."""
 
-    def __init__(self, timeout: int = 30):
+    def __init__(self, timeout: int = 60):
         self.base_url = UNGH_BASE_URL
         self.timeout = timeout
         self._session: Optional[aiohttp.ClientSession] = None
+        self._semaphore = asyncio.Semaphore(3)
 
     async def __aenter__(self):
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            limit_per_host=5,
+            force_close=True,
+        )
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.timeout)
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            connector=connector,
         )
         return self
 
@@ -52,19 +60,39 @@ class UnghClient:
     async def get_repo(self, owner: str, repo: str) -> UnghRepo:
         """Get repository info."""
         url = f"{self.base_url}/repos/{owner}/{repo}"
-        async with self._session.get(url) as resp:
-            data = await resp.json()
-            r = data["repo"]
-            return UnghRepo(
-                id=r["id"],
-                name=r["name"],
-                owner=owner,
-                description=r.get("description", ""),
-                stars=r.get("stars", 0),
-                default_branch=r.get("defaultBranch", "main"),
-                created_at=r.get("createdAt", ""),
-                updated_at=r.get("updatedAt", ""),
-            )
+        async with self._semaphore:
+            try:
+                async with self._session.get(url) as resp:
+                    data = await resp.json()
+
+                    # Check for error response (404, private repo, etc.)
+                    if data.get("error"):
+                        raise ValueError(f"UNgh error: {data.get('message', 'Unknown error')} (status: {data.get('status', 'unknown')})")
+
+                    if "repo" not in data:
+                        raise ValueError(f"UNgh response missing 'repo' key: {data}")
+
+                    r = data["repo"]
+                    return UnghRepo(
+                        id=r["id"],
+                        name=r["name"],
+                        owner=owner,
+                        description=r.get("description", ""),
+                        stars=r.get("stars", 0),
+                        default_branch=r.get("defaultBranch", "main"),
+                        created_at=r.get("createdAt", ""),
+                        updated_at=r.get("updatedAt", ""),
+                    )
+            except asyncio.TimeoutError:
+                raise ValueError(f"UNgh timeout for {owner}/{repo}")
+            except aiohttp.ClientError as e:
+                raise ValueError(f"UNgh network error for {owner}/{repo}: {type(e).__name__}")
+            except Exception as e:
+                # Re-raise ValueError as-is, wrap others
+                if isinstance(e, ValueError):
+                    raise
+                raise ValueError(f"UNgh request failed for {owner}/{repo}: {e}")
+
 
     async def get_files(
         self, owner: str, repo: str, branch: str = "main"

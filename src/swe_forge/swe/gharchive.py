@@ -33,6 +33,7 @@ class GhArchiveEvent(BaseModel):
     action: str
     pull_number: int
     base_sha: str = ""
+    head_sha: str = ""
     merge_sha: str = ""
     title: str = ""
     body: str = ""
@@ -335,6 +336,7 @@ class GhArchiveClient:
                 action="merged",
                 pull_number=pr.get("number", 0),
                 base_sha=pr.get("base", {}).get("sha", ""),
+                head_sha=pr.get("head", {}).get("sha", ""),
                 merge_sha=pr.get("merge_commit_sha", ""),
                 title=pr.get("title", "Untitled change"),
                 body=pr.get("body", "") or "",

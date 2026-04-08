@@ -296,16 +296,23 @@ class TestCountDeletions:
         assert count_deletions(diff) == 0
 
 
+def _make_gh_client_mock(diff_return=None):
+    """Create a mock GitHubClient with sparse fetch / fallback methods."""
+    client = MagicMock()
+    client.get_pr_diff_via_sparse_fetch = AsyncMock(
+        return_value=diff_return if diff_return is not None else make_diff()
+    )
+    client.get_pr_diff_via_api_compare = AsyncMock(return_value=None)
+    client.get_pr_diff_via_git = AsyncMock(return_value=None)
+    return client
+
+
 class TestEnrichPr:
     @pytest.mark.asyncio
     async def test_enrich_success(self):
         event = make_event(title="Test PR")
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(
-            return_value=make_diff(
-                files=["a.py", "b.py", "c.py"], additions=50, deletions=25
-            )
-        )
+        diff = make_diff(files=["a.py", "b.py", "c.py"], additions=50, deletions=25)
+        client = _make_gh_client_mock(diff)
 
         result = await enrich_pr(event, client)
 
@@ -317,24 +324,19 @@ class TestEnrichPr:
         assert result.deletions == 75
 
     @pytest.mark.asyncio
-    async def test_enrich_uses_single_diff_call(self):
+    async def test_enrich_uses_sparse_fetch(self):
         event = make_event()
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(return_value=make_diff())
+        client = _make_gh_client_mock()
 
         await enrich_pr(event, client)
 
-        client.get_pr_diff.assert_called_once_with("owner", "repo", 123)
+        client.get_pr_diff_via_sparse_fetch.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_enrich_detects_language(self):
         event = make_event()
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(
-            return_value=make_diff(
-                files=["main.py", "utils.py"], additions=10, deletions=5
-            )
-        )
+        diff = make_diff(files=["main.py", "utils.py"], additions=10, deletions=5)
+        client = _make_gh_client_mock(diff)
 
         result = await enrich_pr(event, client)
         assert result.language == "python"
@@ -343,8 +345,7 @@ class TestEnrichPr:
     async def test_enrich_uses_language_hint(self):
         event = make_event()
         event.language_hint = "go"
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(return_value="")
+        client = _make_gh_client_mock("")
 
         result = await enrich_pr(event, client)
         assert result.language == "go"
@@ -352,8 +353,7 @@ class TestEnrichPr:
     @pytest.mark.asyncio
     async def test_enrich_detects_bot(self):
         event = make_event(user="dependabot[bot]")
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(return_value=make_diff())
+        client = _make_gh_client_mock()
 
         result = await enrich_pr(event, client)
         assert result.is_bot is True
@@ -361,8 +361,7 @@ class TestEnrichPr:
     @pytest.mark.asyncio
     async def test_enrich_extracts_linked_issues(self):
         event = make_event(body="This PR fixes #100 and closes #200")
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(return_value=make_diff())
+        client = _make_gh_client_mock()
 
         result = await enrich_pr(event, client)
         assert 100 in result.linked_issues
@@ -371,8 +370,10 @@ class TestEnrichPr:
     @pytest.mark.asyncio
     async def test_enrich_fallback_on_api_error(self):
         event = make_event(title="Event Title", body="Event Body")
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(side_effect=Exception("API Error"))
+        client = _make_gh_client_mock()
+        client.get_pr_diff_via_sparse_fetch = AsyncMock(side_effect=Exception("Sparse Error"))
+        client.get_pr_diff_via_api_compare = AsyncMock(return_value=None)
+        client.get_pr_diff_via_git = AsyncMock(side_effect=Exception("Clone Error"))
 
         result = await enrich_pr(event, client)
 
@@ -387,8 +388,7 @@ class TestEnrichPr:
             body="PR Body from Event",
             user="developer",
         )
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(return_value=make_diff())
+        client = _make_gh_client_mock()
 
         result = await enrich_pr(event, client)
 
@@ -401,8 +401,7 @@ class TestEnrichPrsBatch:
     @pytest.mark.asyncio
     async def test_batch_enriches_all(self):
         events = [make_event(number=i) for i in range(1, 4)]
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(return_value=make_diff())
+        client = _make_gh_client_mock()
 
         results = await enrich_prs_batch(events, client, concurrency=5)
 
@@ -414,8 +413,7 @@ class TestEnrichPrsBatch:
     @pytest.mark.asyncio
     async def test_batch_respects_concurrency(self):
         events = [make_event(number=i) for i in range(10)]
-        client = MagicMock(spec=["get_pr_diff"])
-        client.get_pr_diff = AsyncMock(return_value=make_diff())
+        client = _make_gh_client_mock()
 
         results = await enrich_prs_batch(events, client, concurrency=2)
 

@@ -500,7 +500,7 @@ class TurnBudget:
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_CONTEXT_TOKENS = 200000
-DEFAULT_KEEP_LAST_N = 10
+DEFAULT_KEEP_LAST_N = 25
 
 
 def _get_token_encoder():
@@ -586,6 +586,19 @@ class AgenticLoop:
         self._keep_last_n = keep_last_n
         self._encoder = _get_token_encoder()
         self._compaction_count = 0
+        self._preserved_context: str = ""
+
+    def set_preserved_context(self, context: str) -> None:
+        """Store context that must survive compaction.
+
+        This context will be prepended to the summary message during
+        compaction, ensuring critical information (like written files,
+        patch location, install commands) is not lost.
+
+        Args:
+            context: Context string to preserve across compaction.
+        """
+        self._preserved_context = context
 
     @property
     def budget(self) -> TurnBudget:
@@ -735,11 +748,13 @@ class AgenticLoop:
         """Check if compaction is needed based on token count."""
         return self.token_count() > self._max_context_tokens
 
-    def compact(self, llm_client=None, model: str = "gpt-4o-mini") -> int:
+    async def compact(self, llm_client=None, model: str = "gpt-4o-mini") -> int:
         """Compact message history to reduce token count.
 
         Strategy: Keep system message + recent turns, truncate middle.
         If llm_client is provided, uses LLM to summarize middle messages.
+        Important messages containing write_file or submit_tests tool calls
+        are preserved from older messages (up to 10 extra).
 
         Args:
             llm_client: Optional LLM client for summarization.
@@ -769,18 +784,41 @@ class AgenticLoop:
         if not middle:
             return 0
 
-        summary_content = self._summarize_messages(middle, llm_client, model)
-        summary_msg = Message.system(f"[Previous context summary]\n{summary_content}")
+        # Smart message selection: keep important messages from older history
+        important_msgs: list[Message] = []
+        for msg in middle:
+            if len(important_msgs) >= 10:
+                break
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.function.name in ("write_file", "submit_tests"):
+                        important_msgs.append(msg)
+                        break
+
+        summary_content = await self._summarize_messages(middle, llm_client, model)
+
+        # Prepend preserved context if non-empty
+        if self._preserved_context:
+            full_summary = (
+                f"## PRESERVED CONTEXT (survives compaction)\n"
+                f"{self._preserved_context}\n\n"
+                f"## Summary of previous work\n"
+                f"{summary_content}"
+            )
+        else:
+            full_summary = summary_content
+
+        summary_msg = Message.system(f"[Previous context summary]\n{full_summary}")
 
         if system_msg:
-            self._messages = [system_msg, summary_msg] + recent
+            self._messages = [system_msg, summary_msg] + important_msgs + recent
         else:
-            self._messages = [summary_msg] + recent
+            self._messages = [summary_msg] + important_msgs + recent
 
         self._compaction_count += 1
         return original_tokens - self.token_count()
 
-    def _summarize_messages(
+    async def _summarize_messages(
         self, messages: list[Message], llm_client=None, model: str = "gpt-4o-mini"
     ) -> str:
         """Summarize a list of messages.
@@ -801,8 +839,6 @@ class AgenticLoop:
         )
 
         if llm_client is not None:
-            import asyncio
-
             try:
                 from swe_forge.llm.client import GenerationRequest
 
@@ -838,28 +874,19 @@ Messages:
 
 Summary:"""
 
-                async def get_summary():
-                    request = GenerationRequest(
-                        model=model,
-                        messages=[Message.user(prompt)],
-                        max_tokens=800,
-                    )
-                    response = await llm_client.complete(request)
-                    return response.first_content() or message_preview[:500]
-
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        return message_preview[:500]
-                    return loop.run_until_complete(get_summary())
-                except RuntimeError:
-                    return message_preview[:500]
+                request = GenerationRequest(
+                    model=model,
+                    messages=[Message.user(prompt)],
+                    max_tokens=800,
+                )
+                response = await llm_client.complete(request)
+                return response.first_content() or message_preview[:500]
             except Exception:
                 pass
 
         return message_preview[:500]
 
-    def compact_if_needed(self, llm_client=None, model: str = "gpt-4o-mini") -> bool:
+    async def compact_if_needed(self, llm_client=None, model: str = "gpt-4o-mini") -> bool:
         """Compact if needed, return True if compaction occurred.
 
         Args:
@@ -870,7 +897,7 @@ Summary:"""
             True if compaction occurred, False otherwise.
         """
         if self.should_compact():
-            self.compact(llm_client, model)
+            await self.compact(llm_client, model)
             return True
         return False
 

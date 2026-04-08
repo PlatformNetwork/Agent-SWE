@@ -190,6 +190,7 @@ class SwePipeline:
         self._filter_config = self._build_filter_config()
         self._active = False
         self._classifier: DifficultyClassifier | None = None
+        self._repo_cache: dict[str, RepoInfo | None] = {}
 
     def _build_filter_config(self) -> FilterConfig:
         """Build filter config from pipeline config."""
@@ -230,10 +231,32 @@ class SwePipeline:
         self._active = False
         await self.gh_archive_client.close()
 
+    @staticmethod
+    def _image_for_language(language: str) -> str:
+        """Map a programming language to an appropriate Docker image.
+
+        Args:
+            language: Language name (lowercase).
+
+        Returns:
+            Docker image string suitable for the language.
+        """
+        lang = (language or "").lower()
+        mapping: dict[str, str] = {
+            "python": "python:3.12-slim",
+            "javascript": "node:20-slim",
+            "typescript": "node:20-slim",
+            "rust": "rust:slim",
+            "go": "golang:1.22-bookworm",
+        }
+        return mapping.get(lang, "ubuntu:24.04")
+
     async def _create_sandbox(
         self,
         repo_url: str,
         base_commit: str,
+        *,
+        language: str = "",
     ) -> DockerSandbox:
         """Create a DockerSandbox configured for task execution.
 
@@ -243,16 +266,108 @@ class SwePipeline:
         Args:
             repo_url: Repository URL to clone (e.g., "https://github.com/owner/repo").
             base_commit: Base commit SHA to checkout.
+            language: Programming language for selecting the Docker image.
 
         Returns:
-            DockerSandbox instance configured with ubuntu:24.04 image.
+            DockerSandbox instance configured with a language-appropriate image.
             The sandbox is not yet started - caller must use async context manager.
         """
         from swe_forge.execution.sandbox import DockerSandbox, SandboxConfig
 
+        image = self._image_for_language(language)
         client = DockerClient()
-        config = SandboxConfig(image="ubuntu:24.04")
+        config = SandboxConfig(image=image)
         return DockerSandbox(client, config)
+
+    async def _validate_in_clean_sandbox(
+        self,
+        task: SweTask,
+        generated: "GeneratedTests",
+        repo_url: str,
+    ) -> bool:
+        """Validate generated tests in a fresh Docker container.
+
+        Returns True if: fail_to_pass FAIL on base, PASS after patch.
+        """
+        language = task.language or "python"
+        sandbox = await self._create_sandbox(repo_url, task.base_commit, language=language)
+
+        try:
+            async with sandbox:
+                await sandbox.setup_workspace(repo_url, task.base_commit)
+
+                # Write test files to sandbox using run_command (paths may be absolute)
+                for tf in generated.test_files:
+                    import base64 as b64mod
+
+                    tf_path = tf.path
+                    if not tf_path.startswith("/"):
+                        tf_path = f"/workspace/repo/{tf_path}"
+                    encoded_content = b64mod.b64encode(tf.content.encode()).decode()
+                    await sandbox.run_command(f"mkdir -p $(dirname '{tf_path}')")
+                    await sandbox.run_command(
+                        f"echo '{encoded_content}' | base64 -d > '{tf_path}'"
+                    )
+
+                # Write patch
+                if task.patch:
+                    import base64
+
+                    await sandbox.run_command("mkdir -p /workspace/forge")
+                    patch_b64 = base64.b64encode(task.patch.encode()).decode()
+                    await sandbox.run_command(
+                        f"echo '{patch_b64}' | base64 -d > /workspace/forge/patch.diff"
+                    )
+
+                # Run install commands
+                for cmd in generated.install_commands:
+                    await sandbox.run_command(
+                        f"cd /workspace/repo && {cmd}", timeout=180
+                    )
+
+                # Phase 1: fail_to_pass must FAIL on base
+                for cmd in generated.fail_to_pass:
+                    result = await sandbox.run_command(
+                        f"cd /workspace/repo && {cmd}", timeout=180
+                    )
+                    if result.exit_code == 0:
+                        logger.warning(
+                            "Clean validation FAILED: %s PASSED on base (should fail)",
+                            cmd,
+                        )
+                        return False
+
+                # Apply patch
+                apply_result = await sandbox.run_command(
+                    "cd /workspace/repo && git apply /workspace/forge/patch.diff",
+                    timeout=60,
+                )
+                if apply_result.exit_code != 0:
+                    apply_result = await sandbox.run_command(
+                        "cd /workspace/repo && git apply --3way /workspace/forge/patch.diff",
+                        timeout=60,
+                    )
+                    if apply_result.exit_code != 0:
+                        logger.warning("Clean validation FAILED: patch apply failed")
+                        return False
+
+                # Phase 2: fail_to_pass must PASS after patch
+                for cmd in generated.fail_to_pass:
+                    result = await sandbox.run_command(
+                        f"cd /workspace/repo && {cmd}", timeout=180
+                    )
+                    if result.exit_code != 0:
+                        logger.warning(
+                            "Clean validation FAILED: %s FAILED after patch (should pass)",
+                            cmd,
+                        )
+                        return False
+
+                logger.info("Clean validation PASSED for task %s", task.id)
+                return True
+        except Exception as e:
+            logger.warning("Clean validation error for %s: %s", task.id, e)
+            return False
 
     async def _emit_event(
         self, queue: asyncio.Queue[SwePipelineEvent] | None, event: SwePipelineEvent
@@ -269,10 +384,11 @@ class SwePipeline:
         event: GhArchiveEvent,
         metrics: BenchmarkMetrics,
     ) -> RepoInfo | None:
-        """Prefilter repository using GitHub API for reliable star data.
+        """Prefilter repository using cached data and GH Archive stars.
 
-        Uses GitHub API to check repository stars, ensuring accurate
-        star counts for quality filtering before expensive processing.
+        Uses GH Archive star data for fast rejection, then falls back to
+        GitHub API only when stars are unknown (0). Results are cached
+        per-repo to avoid redundant API calls.
 
         Args:
             event: GH Archive event with repository info.
@@ -281,32 +397,75 @@ class SwePipeline:
         Returns:
             RepoInfo if repo passes filters, None if rejected or on error.
         """
+        cache_key = event.repository
+
+        # Fast path: return cached result
+        if cache_key in self._repo_cache:
+            cached = self._repo_cache[cache_key]
+            if cached is not None:
+                event.stars = cached.stars
+            return cached
+
+        # Fast rejection using GH Archive stars (no API call needed)
+        if event.stars > 0 and self.config.min_stars and event.stars < self.config.min_stars:
+            logger.debug(
+                "Prefilter rejected %s - GH Archive stars %d < %d",
+                event.repository,
+                event.stars,
+                self.config.min_stars,
+            )
+            self._repo_cache[cache_key] = None
+            return None
+
         try:
             parts = event.repository.split("/", 1)
             owner = parts[0]
             repo = parts[1] if len(parts) > 1 else ""
 
-            # Use GitHub API for reliable star data
+            # Only call API if stars unknown or to get full repo info
             repo_info = await self.gh_client.get_repo(owner, repo)
-
-            # Update event stars from API response
             event.stars = repo_info.stars
 
-            # Check star requirement
             if self.config.min_stars and repo_info.stars < self.config.min_stars:
                 logger.debug(
-                    "Prefilter rejected %s - stars %d < %d",
+                    "Prefilter rejected %s - API stars %d < %d",
                     event.repository,
                     repo_info.stars,
                     self.config.min_stars,
                 )
+                self._repo_cache[cache_key] = None
                 return None
 
+            self._repo_cache[cache_key] = repo_info
             return repo_info
 
         except Exception as e:
             logger.warning("GitHub API failed for %s: %s", event.repository, e)
-            # Return None on error (reject the repo)
+            # If GH Archive stars are sufficient, create a minimal RepoInfo
+            if event.stars >= self.config.min_stars:
+                parts = event.repository.split("/", 1)
+                owner = parts[0]
+                repo = parts[1] if len(parts) > 1 else ""
+                fallback = RepoInfo(
+                    id=0,
+                    name=repo,
+                    owner=owner,
+                    full_name=event.repository,
+                    description="",
+                    stars=event.stars,
+                    language=event.language_hint or "unknown",
+                    default_branch="main",
+                    created_at="",
+                    updated_at="",
+                )
+                self._repo_cache[cache_key] = fallback
+                logger.info(
+                    "Using GH Archive fallback for %s (stars=%d)",
+                    event.repository,
+                    event.stars,
+                )
+                return fallback
+            self._repo_cache[cache_key] = None
             return None
 
     async def _enrich_stage(
@@ -589,10 +748,22 @@ class SwePipeline:
         sandbox: DockerSandbox | None = None
 
         try:
-            sandbox = await self._create_sandbox(repo_url, enriched.base_commit)
+            sandbox = await self._create_sandbox(
+                repo_url, enriched.base_commit, language=enriched.language
+            )
 
             async with sandbox:
                 await sandbox.setup_workspace(repo_url, enriched.base_commit)
+
+                # Pre-seed patch file so LLM can access it even after context compaction
+                if task.patch:
+                    import base64
+
+                    await sandbox.run_command("mkdir -p /workspace/forge")
+                    patch_b64 = base64.b64encode(task.patch.encode()).decode()
+                    await sandbox.run_command(
+                        f"echo '{patch_b64}' | base64 -d > /workspace/forge/patch.diff"
+                    )
 
                 generated: GeneratedTests = (
                     await self.config.test_generator.generate_tests(  # type: ignore[union-attr]
@@ -605,19 +776,27 @@ class SwePipeline:
                 task.dataset_prompt = generated.dataset_prompt
 
                 if generated.test_files:
-                    test_files_content = "\n".join(
-                        f"# Test file: {tf.path}\n{tf.content}"
+                    task.generated_test_files = [
+                        {"path": tf.path, "content": tf.content}
                         for tf in generated.test_files
-                    )
-                    if task.test_patch:
-                        task.test_patch = f"{task.test_patch}\n\n{test_files_content}"
-                    else:
-                        task.test_patch = test_files_content
+                    ]
 
                 if generated.success:
-                    task.quality_score = 1.0
-                    task.quality_passed = True
-                    task.status = SweTaskStatus.READY
+                    # Validate in clean container before accepting
+                    clean_passed = await self._validate_in_clean_sandbox(
+                        task, generated, repo_url
+                    )
+                    if clean_passed:
+                        task.quality_score = 1.0
+                        task.quality_passed = True
+                        task.status = SweTaskStatus.READY
+                    else:
+                        task.quality_score = 0.0
+                        task.quality_passed = False
+                        task.status = SweTaskStatus.REJECTED
+                        logger.warning(
+                            "Task %s rejected: clean validation failed", task.id
+                        )
                 else:
                     task.quality_score = 0.0
                     task.quality_passed = False
@@ -702,6 +881,11 @@ class SwePipeline:
             return True
         if not event.has_org:
             return True
+        # Pre-filter by language hint if available (GH Archive often lacks this)
+        if event.language_hint:
+            allowed = self.config.languages or ["python"]
+            if event.language_hint not in allowed:
+                return True
         return False
 
     def _is_test_file(self, filename: str) -> bool:
@@ -957,6 +1141,11 @@ class SwePipeline:
                     metrics.prefilter_rejected += 1
                     return None
 
+                # Propagate repo language from API to event
+                repo_lang = getattr(repo_info, "language", None)
+                if repo_lang and not event.language_hint:
+                    event.language_hint = repo_lang.lower()
+
                 early_difficulty = await self._early_triage_stage(
                     event, preclassify_sem, metrics
                 )
@@ -973,10 +1162,21 @@ class SwePipeline:
                 if enriched is None:
                     return None
 
-                if enriched.title == "Untitled change" or not enriched.merge_commit:
+                if not enriched.merge_commit:
+                    logger.debug(
+                        "Rejecting %s#%d: no merge_commit",
+                        enriched.repo,
+                        enriched.number,
+                    )
+                    metrics.enrichment_failed += 1
                     return None
 
                 if enriched.files_changed == 0:
+                    logger.debug(
+                        "Rejecting %s#%d: no changed files",
+                        enriched.repo,
+                        enriched.number,
+                    )
                     return None
 
                 if not self._filter_stage(enriched, metrics):
@@ -1060,8 +1260,17 @@ class SwePipeline:
 
                 return task
 
+            # Limit overall concurrency to avoid overwhelming Oxylabs/API
+            # Lower when test_generator is active (Docker sandboxes are heavy)
+            max_concurrent = 20 if self.config.test_generator else 50
+            event_sem = asyncio.Semaphore(max_concurrent)
+
+            async def throttled_process(ev: GhArchiveEvent) -> SweTask | None:
+                async with event_sem:
+                    return await process_event(ev)
+
             for event in events:
-                task = asyncio.create_task(process_event(event))
+                task = asyncio.create_task(throttled_process(event))
                 pending_tasks.append(task)
 
             batch_valid = 0
@@ -1072,12 +1281,11 @@ class SwePipeline:
                         if result.quality_passed:
                             batch_valid += 1
                             valid_tasks_count += 1
-
-                        accepted_tasks.append(result)
-                        yield SwePipelineEvent(
-                            SwePipelineEventType.TASK_EXTRACTED,
-                            {"task": result, "task_id": result.id},
-                        )
+                            accepted_tasks.append(result)
+                            yield SwePipelineEvent(
+                                SwePipelineEventType.TASK_EXTRACTED,
+                                {"task": result, "task_id": result.id},
+                            )
 
                         yield SwePipelineEvent(
                             SwePipelineEventType.PIPELINE_PROGRESS,

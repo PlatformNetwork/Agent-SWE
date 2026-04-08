@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(
         default="", description="Anthropic API key (optional)"
     )
+    oxylabs_username: str = Field(default="", description="Oxylabs proxy username")
+    oxylabs_password: str = Field(default="", description="Oxylabs proxy password")
+    oxylabs_rps: int = Field(default=40, description="Oxylabs max requests per second")
     log_level: str = Field(default="INFO", description="Logging level")
     model_name: str = Field(
         default="openai/gpt-4o-mini", description="Default model name for LLM calls"

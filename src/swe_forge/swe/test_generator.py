@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shlex
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from logging import getLogger
@@ -44,12 +45,15 @@ logger = getLogger(__name__)
 
 MAX_AGENT_TURNS = 400
 
-# ContextVar for per-async-task dataset_prompt isolation
+# ContextVars for per-async-task isolation
 _dataset_prompt_var: ContextVar[str] = ContextVar("dataset_prompt", default="")
+_written_files_var: ContextVar[list] = ContextVar("written_files", default=[])
+_task_var: ContextVar = ContextVar("task", default=None)
+_validation_retry_count_var: ContextVar[int] = ContextVar("validation_retry_count", default=0)
 MAX_VALIDATION_RETRIES = 10
 DEFAULT_TIMEOUT_MS = 60_000
-PRE_APPLY_TIMEOUT_SECONDS = 60  # 60s timeout for pre-apply test validation
-POST_APPLY_TIMEOUT_SECONDS = 60  # 60s timeout for post-apply test validation
+PRE_APPLY_TIMEOUT_SECONDS = 180  # 180s timeout for pre-apply test validation
+POST_APPLY_TIMEOUT_SECONDS = 180  # 180s timeout for post-apply test validation
 
 KNOWN_REPO_PATTERNS = [
     "glassflow-api",
@@ -136,27 +140,152 @@ def _get_progressive_hint(error_type: str, retry_count: int) -> str:
 # System Prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Generate tests for a software bug fix.
+SYSTEM_PROMPT = """Generate behavioral tests for a software bug fix.
 
-CRITICAL: Your tests MUST:
-1. FAIL on the base commit (before the patch applies)
-2. PASS after applying the patch
-3. Test files MUST be in tests/ directory (e.g., tests/test_xxx.py)
+## BUDGET AWARENESS
 
-PROCESS:
-1. Call set_dataset_prompt with a short description (5-10 words)
-2. Read the patch to understand what bug is being fixed
-3. Identify the specific behavior change (bug vs fixed)
-4. Write a test that triggers the BUG behavior on base commit
-5. Run your test on base commit to verify it FAILS
-6. Apply patch: cd /repo && git apply /workspace/patch.diff
-7. Run your test after patch to verify it PASSES
-8. Submit with submit_tests()
+You have a limited number of turns. Be efficient. Try the simplest test approach first.
+Don't spend many turns installing complex dependencies. Use the pre-installed language toolchain.
+Aim to submit tests within 10-15 turns.
 
-IMPORTANT:
-- Tests that always pass are INVALID (don't test the bug)
-- Tests that always fail are INVALID (wrong behavior expected)
-- You MUST run tests at least once before and after patch
+## YOUR MISSION
+
+Generate tests that:
+1. FAIL on base commit (proves bug exists)
+2. PASS after applying patch (proves fix works)
+
+## WORKSPACE
+
+- Repository: /workspace/repo/ (checked out at the base commit, BEFORE the fix)
+- Patch: /workspace/forge/patch.diff (the fix that was applied)
+
+## PHASE 1: DISCOVERY (MANDATORY FIRST STEP)
+
+You MUST discover the project structure BEFORE writing any tests:
+
+1. DETECT LANGUAGE:
+   - List files in /workspace/repo to find package files
+   - Python: pyproject.toml, setup.py, requirements.txt, setup.cfg
+   - JavaScript/TypeScript: package.json, tsconfig.json
+   - Rust: Cargo.toml
+   - Go: go.mod, go.sum
+   - Java: pom.xml, build.gradle, build.gradle.kts
+   - Ruby: Gemfile, Rakefile
+   - PHP: composer.json
+
+2. DISCOVER TEST FRAMEWORK:
+   - Read package files to find test dependencies
+   - Python: look for pytest, unittest, nose in requirements
+   - JavaScript: look for jest, mocha, vitest in package.json
+   - Rust: tests in Cargo.toml, use `cargo test`
+   - Go: _test.go files, use `go test`
+   - Java: junit dependency, use `mvn test` or `gradle test`
+
+3. DISCOVER TEST LOCATION:
+   - Python: tests/ or test_ directories, test_*.py files
+   - JavaScript: tests/, test/, __tests__/, *.test.js, *.spec.js
+   - Rust: tests/ directory, #[test] in src/
+   - Go: *_test.go files alongside source
+   - Java: src/test/java/
+
+4. DISCOVER INSTALL COMMANDS:
+   - Read package files, Makefile, README, CI configs (.github/workflows/)
+   - Try commands and verify exit code 0
+   - DO NOT guess - DISCOVER by trying
+
+## PHASE 2: PATCH ANALYSIS
+
+After discovering the project structure, analyze the patch to understand the bug:
+
+1. Read the patch: shell("cat /workspace/forge/patch.diff")
+2. Identify CHANGED FILES from the diff headers (diff --git a/... b/...)
+3. For each changed file, use read_file() to examine the full context of changes
+4. Identify CHANGED FUNCTIONS/METHODS - what specific functions were modified?
+5. Determine the BEHAVIORAL DIFFERENCE:
+   - BEFORE the patch: what was the broken behavior? (exception, wrong output, missing feature)
+   - AFTER the patch: what is the correct behavior?
+6. This behavioral difference is EXACTLY what your test must exercise
+
+## PHASE 3: TEST GENERATION
+
+1. set_dataset_prompt("Brief description of what changed")
+2. Write a test that exercises the BROKEN behavior:
+   - Import/require the affected module
+   - Call the changed function with inputs that trigger the bug
+   - Assert the CORRECT (post-fix) behavior
+3. Verify the test runs (syntax check): shell("pytest tests/test_fix.py --collect-only") or equivalent
+4. Submit with submit_tests() - it automatically validates:
+   - Runs your fail_to_pass tests on base commit (must FAIL)
+   - Applies the patch
+   - Runs your fail_to_pass tests again (must PASS)
+
+NOTE: You do NOT need to manually apply or revert the patch. submit_tests() handles this automatically.
+
+## VALIDATION RULES
+
+When you call submit_tests(), it automatically:
+  (a) Runs fail_to_pass on base commit — tests must FAIL
+  (b) Applies the patch
+  (c) Runs fail_to_pass again — tests must PASS
+
+- `install_commands` is REQUIRED and must be non-empty (e.g., ["pip install -e ."])
+- String-matching tests (reading source files and asserting content) are REJECTED
+- You get up to 10 retry attempts if validation fails
+
+## COMMON FAILURES AND RECOVERY
+
+- ImportError → install the missing package first (e.g., shell("pip install package"))
+- ModuleNotFoundError → check if you need `pip install -e .` or the project uses a virtualenv
+- Test PASSES on base (should fail) → your test doesn't exercise the bug; rethink what behavior changed
+- Test FAILS after patch (should pass) → your test assertion is wrong; check the actual post-fix behavior
+- Timeout → simplify the test, use smaller inputs, avoid integration tests
+
+## CRITICAL RULES
+
+- NEVER assume test commands - DISCOVER them
+- NEVER assume test directory - FIND what the project uses
+- Follow existing test patterns in the repository
+- Test MUST fail before patch, pass after patch
+- If unsure, read existing test files in the repo for patterns
+
+## FEW-SHOT PATTERNS (language-agnostic)
+
+### Pattern 1: Behavior Changed - Output/Message Different
+BEFORE PATCH: function returns "Error: X"
+AFTER PATCH: function returns "Error: Y"
+TEST: call function, assert it returns "Y" (fails before, passes after)
+
+### Pattern 2: Bug Fixed - Previously Broken Feature Now Works
+BEFORE PATCH: feature X throws exception
+AFTER PATCH: feature X works correctly
+TEST: use feature X, expect success (fails before, passes after)
+
+### Pattern 3: Logic Fixed - Calculation/Transformation Corrected
+BEFORE PATCH: calculate(10) returns 20
+AFTER PATCH: calculate(10) returns 10
+TEST: assert calculate(10) == 10 (fails before, passes after)
+
+### Pattern 4: Validation Added - Previously Invalid Now Rejected
+BEFORE PATCH: invalid input accepted
+AFTER PATCH: invalid input rejected
+TEST: expect rejection on invalid input (fails before, passes after)
+
+## END-TO-END EXAMPLE WORKFLOW
+
+Example workflow showing the complete tool call sequence:
+1. shell("cat /workspace/forge/patch.diff") → understand what changed
+2. shell("cat pyproject.toml") → find test framework
+3. read_file("src/module.py") → understand the changed function
+4. write_file("tests/test_fix.py", "import pytest\\n...") → write test
+5. shell("pip install -e . && pytest tests/test_fix.py --collect-only") → verify syntax
+6. set_dataset_prompt("Fix divide by zero in calculate()")
+7. submit_tests(fail_to_pass=["pytest tests/test_fix.py -v"], install_commands=["pip install -e ."])
+
+## SUBMISSION FORMAT
+
+install_commands: ["apt-get update", "apt-get install -y python3", ...]
+fail_to_pass: ["pytest tests/test_feature.py", "cargo test test_feature", "go test ./...", "npm test"]
+pass_to_pass: [] (optional tests that should keep passing)
 
 ## FEW-SHOT EXAMPLES
 
@@ -169,7 +298,7 @@ def test_store_false_not_retrievable():
     with pytest.raises(Exception):  # BUG: was retrievable
         client.retrieve(response_id)
 
-### Example 2: Python pytest - Config Defaults Override Bug  
+### Example 2: Python pytest - Config Defaults Override Bug
 # Bug: Defaults overrode explicit config values
 def test_explicit_values_preserved():
     # FAILS before patch, PASSES after
@@ -407,6 +536,15 @@ def search_files_tool_schema() -> ToolDefinition:
     )
 
 
+def show_patch_tool_schema() -> ToolDefinition:
+    """Create the show_patch tool schema."""
+    return ToolDefinition.create(
+        name="show_patch",
+        description="Show the complete patch/diff for the current task. Use this when you need to re-read the patch after context compaction.",
+        parameters={"type": "object", "properties": {}, "required": []},
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool Result Types
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,6 +581,34 @@ class ToolResult:
 # ─────────────────────────────────────────────────────────────────────────────
 # Validation Functions
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_changed_files(patch: str) -> list[str]:
+    """Extract changed file paths from diff headers in a patch.
+
+    Parses lines like 'diff --git a/path/to/file b/path/to/file' and returns
+    unique file paths in order of appearance.
+
+    Args:
+        patch: Unified diff content.
+
+    Returns:
+        List of unique changed file paths.
+    """
+    if not patch:
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            # Format: diff --git a/path b/path
+            parts = line.split(" b/", 1)
+            if len(parts) == 2:
+                path = parts[1].strip()
+                if path and path not in seen:
+                    seen.add(path)
+                    result.append(path)
+    return result
+
 
 STRING_MATCHING_PATTERNS: list[tuple[str, str]] = [
     # Python source-reading patterns
@@ -692,7 +858,7 @@ class TestGenerator:
         max_turns: int = MAX_AGENT_TURNS,
         model: str = "",
         temperature: float = 0.2,
-        max_tokens: int = 2000,
+        max_tokens: int = 4096,
         max_context_tokens: int = 100000,
     ):
         """Initialize TestGenerator.
@@ -711,9 +877,6 @@ class TestGenerator:
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._max_context_tokens = max_context_tokens
-        self._written_files: list[TestFile] = []
-        self._task: Any = None
-        self._validation_retry_count: int = 0
 
     def _get_tools(self) -> list[ToolDefinition]:
         """Get all tool schemas for the agent."""
@@ -733,6 +896,7 @@ class TestGenerator:
             search_files_tool_schema(),
             write_file_tool_schema(),
             apply_patch_tool_schema(),
+            show_patch_tool_schema(),
         ]
 
     def _truncate(self, s: str, max_len: int = 4000) -> str:
@@ -741,19 +905,48 @@ class TestGenerator:
             return s
         return s[:max_len] + "..."
 
+    def _smart_truncate(self, text: str, max_len: int) -> str:
+        """Truncate text keeping beginning and end for pytest summary visibility."""
+        if len(text) <= max_len:
+            return text
+        # Keep beginning (context) and end (pytest summary/errors)
+        head = max_len // 4
+        tail = max_len - head - 20
+        return text[:head] + "\n... [truncated] ...\n" + text[-tail:]
+
     def _build_user_message(self, task: SweTask) -> str:
         """Build the initial user message for the agent."""
-        return f"""## Repository
+        parts: list[str] = []
+
+        parts.append(f"""## Repository
 - Repo: {task.repo}
-- Language: {task.language}
+- Language: {task.language}""")
 
-## Bug Description
-{task.prompt or "No description provided"}
+        parts.append(f"""## Bug Description
+{task.prompt or "No description provided"}""")
 
-## Patch (Changes Made)
-{self._truncate(task.patch, 8000)}
+        # Add PR body if available
+        pr_body = getattr(task, "original_pr_body", "") or ""
+        pr_body = pr_body.strip()
+        if pr_body:
+            parts.append(f"""## PR Description
+{self._truncate(pr_body, 2000)}""")
 
-Generate tests that FAIL on this bug and PASS after applying the patch."""
+        # Extract changed files from diff headers
+        changed_files = _extract_changed_files(task.patch)
+        if changed_files:
+            file_list = "\n".join(f"- {f}" for f in changed_files)
+            parts.append(f"""## Changed Files
+{file_list}""")
+
+        parts.append(f"""## Patch (Changes Made)
+{self._truncate(task.patch, 16000)}""")
+
+        parts.append(
+            "Generate tests that FAIL on this bug and PASS after applying the patch."
+        )
+
+        return "\n\n".join(parts)
 
     def _test_commands_for_language(self, language: str) -> tuple[list[str], list[str]]:
         """Get suggested build and test commands for a language.
@@ -780,8 +973,8 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
 
         try:
             result = await sandbox.run_command(args.command, timeout=timeout_sec)
-            stdout = self._truncate(result.stdout, 3000)
-            stderr = self._truncate(result.stderr, 1500)
+            stdout = self._smart_truncate(result.stdout, 8000)
+            stderr = self._truncate(result.stderr, 3000)
             return ToolResult(
                 content=f"Exit code: {result.exit_code}\n\nStdout:\n{stdout}\n\nStderr:\n{stderr}",
                 is_error=result.exit_code != 0,
@@ -915,7 +1108,7 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
         finally:
             if applied:
                 try:
-                    await sandbox.run_command("git checkout .")
+                    await sandbox.run_command("git checkout . && git clean -fd")
                 except Exception:
                     pass
                 try:
@@ -949,12 +1142,13 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
         try:
             await sandbox.write_file(path, content)
 
-            for existing in self._written_files:
+            written_files = _written_files_var.get()
+            for existing in written_files:
                 if existing.path == path:
                     existing.content = content
                     break
             else:
-                self._written_files.append(TestFile(path=path, content=content))
+                written_files.append(TestFile(path=path, content=content))
 
             logger.debug(f"Agent wrote file: {path} ({len(content)} bytes)")
             return ToolResult(content=f"File written: {path}")
@@ -974,11 +1168,15 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
             content = await sandbox.read_file(path)
 
             lines = content.splitlines()
+            offset = int(arguments.get("offset", 0))
+            limit = int(arguments.get("limit", 200))
+            selected_lines = lines[offset:offset + limit]
             numbered = "\n".join(
-                f"{i + 1}: {line}" for i, line in enumerate(lines[:200])
+                f"{offset + i + 1}: {line}" for i, line in enumerate(selected_lines)
             )
-            if len(lines) > 200:
-                numbered += f"\n... [{len(lines) - 200} more lines truncated]"
+            remaining = len(lines) - (offset + len(selected_lines))
+            if remaining > 0:
+                numbered += f"\n... [{remaining} more lines truncated]"
 
             return ToolResult(
                 content=self._truncate(f"File: {path}\n\n{numbered}", 5000)
@@ -1020,11 +1218,12 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
                 )
 
         elif tool_name == "write_file":
+            task = _task_var.get()
             return await self._handle_write_file(
                 arguments,
                 sandbox,
-                task_repo=self._task.repo if self._task else "",
-                language=self._task.language if self._task else "python",
+                task_repo=task.repo if task else "",
+                language=task.language if task else "python",
             )
 
         elif tool_name == "read_file":
@@ -1045,7 +1244,7 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
             path = arguments.get("path", ".")
             try:
                 result = await sandbox.run_command(
-                    f"grep -rn '{pattern}' {path} | head -100"
+                    f"grep -rn {shlex.quote(pattern)} {shlex.quote(path)} | head -100"
                 )
                 return ToolResult(content=self._truncate(result.stdout, 5000))
             except Exception as e:
@@ -1056,7 +1255,7 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
             path = arguments.get("path", ".")
             try:
                 result = await sandbox.run_command(
-                    f"find {path} -name '{pattern}' | head -100"
+                    f"find {shlex.quote(path)} -name {shlex.quote(pattern)} | head -100"
                 )
                 return ToolResult(content=self._truncate(result.stdout, 2000))
             except Exception as e:
@@ -1079,6 +1278,13 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
                 )
             except Exception as e:
                 return ToolResult(content=f"Error applying patch: {e}", is_error=True)
+
+        elif tool_name == "show_patch":
+            task = _task_var.get()
+            patch_content = task.patch if task else ""
+            if not patch_content:
+                return ToolResult(content="No patch available.", is_error=True)
+            return ToolResult(content=patch_content)
 
         elif tool_name == "set_dataset_prompt":
             prompt = arguments.get("prompt", "")
@@ -1106,25 +1312,26 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
         test_files_raw = arguments.get("test_files", [])
         install_commands = arguments.get("install_commands", [])
 
-        self._validation_retry_count += 1
+        _validation_retry_count_var.set(_validation_retry_count_var.get() + 1)
 
         # Pre-apply validation: tests must FAIL on base commit
         valid, error = await self._validate_pre_apply(fail_to_pass, sandbox)
         if not valid:
-            hint = _get_progressive_hint("PASSED on base", self._validation_retry_count)
+            hint = _get_progressive_hint("PASSED on base", _validation_retry_count_var.get())
             return ToolResult(
                 content=f"PRE-APPLY VALIDATION FAILED: {error}\n\n{hint}",
                 is_error=True,
             )
 
         # Post-apply validation: tests must PASS after patch
-        if self._task and hasattr(self._task, "patch") and self._task.patch:
+        task = _task_var.get()
+        if task and hasattr(task, "patch") and task.patch:
             valid, error = await self._validate_post_apply(
-                fail_to_pass, self._task.patch, sandbox
+                fail_to_pass, task.patch, sandbox
             )
             if not valid:
                 hint = _get_progressive_hint(
-                    "FAILED after patch", self._validation_retry_count
+                    "FAILED after patch", _validation_retry_count_var.get()
                 )
                 return ToolResult(
                     content=f"POST-APPLY VALIDATION FAILED: {error}\n\n{hint}",
@@ -1138,7 +1345,7 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
                 test_files.append(TestFile(path=tf["path"], content=tf["content"]))
 
         # Combine with written files
-        all_files = list(self._written_files)
+        all_files = list(_written_files_var.get())
         for tf in test_files:
             if not any(f.path == tf.path for f in all_files):
                 all_files.append(tf)
@@ -1179,9 +1386,9 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
             max_turns=self._max_turns,
             max_context_tokens=self._max_context_tokens,
         )
-        self._written_files = []
-        self._task = task
-        self._validation_retry_count = 0
+        _written_files_var.set([])
+        _task_var.set(task)
+        _validation_retry_count_var.set(0)
         _dataset_prompt_var.set("")  # Reset for each async task
         validation_retries = 0
 
@@ -1193,7 +1400,18 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
         loop.add_user(user_msg)
 
         while not loop.is_exhausted():
-            loop.compact_if_needed(self._llm, self._model)
+            # Update preserved context before each LLM call
+            preserved = []
+            current_task = _task_var.get()
+            if current_task and current_task.patch:
+                preserved.append("Patch file available at: /workspace/forge/patch.diff")
+            written_files = _written_files_var.get()
+            if written_files:
+                for wf in written_files:
+                    preserved.append(f"Written file: {wf.path}")
+            loop.set_preserved_context("\n".join(preserved))
+
+            await loop.compact_if_needed(self._llm, self._model)
 
             request = GenerationRequest(
                 model=self._model,
@@ -1258,10 +1476,10 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
             # Agent must use tools, not write text
             loop.add_assistant(message.content or "")
             loop.add_user(
-                "ERROR: You must use tools (shell, read_file, write_file, submit_tests), not text. "
-                "DO NOT explain. DO NOT ask questions. "
-                "Execute: shell('apt-get update'), read_file('file.py'), write_file('test.py', '...'), submit_tests(...). "
-                "Call a tool NOW."
+                "You must use tools to proceed. Based on your progress so far, "
+                "call shell() to run a command, read_file() to examine code, "
+                "write_file() to create a test, or submit_tests() if you're ready to submit. "
+                "What is your next concrete action?"
             )
             continue
 
@@ -1289,8 +1507,12 @@ Generate tests that FAIL on this bug and PASS after applying the patch."""
                 "after the PR patch is applied."
             )
 
-        # Check install_commands - ALWAYS required
-        if not submit.install_commands:
+        # Check install_commands - required for most languages
+        # Go and Rust handle deps via their build tools, so allow empty
+        task = _task_var.get()
+        lang = (task.language if task else "").lower()
+        needs_install = lang not in ("go", "golang", "rust")
+        if needs_install and not submit.install_commands:
             return (
                 "install_commands must contain at least one command. "
                 "Run installation commands via shell first, verify they succeed "

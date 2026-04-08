@@ -50,7 +50,7 @@ class SandboxConfig:
 
     name: str = "swe-sandbox"
     image: str = "python:latest"  # Agent determines
-    workspace_dir: str = "/repo"
+    workspace_dir: str = "/workspace/repo"
     memory_mb: int = 2048
     cpu_limit: float = 2.0
     pids_limit: int = 200
@@ -218,6 +218,26 @@ class DockerSandbox:
         if self._semaphore_acquired:
             get_docker_semaphore().release()
             self._semaphore_acquired = False
+
+    async def start(self) -> "DockerSandbox":
+        """Start the sandbox container (convenience method).
+
+        Alternative to async context manager for explicit lifecycle control.
+
+        Returns:
+            Self for method chaining.
+
+        Raises:
+            DockerError: If container creation fails.
+        """
+        return await self.__aenter__()
+
+    async def stop(self) -> None:
+        """Stop and cleanup the sandbox container (convenience method).
+
+        Alternative to async context manager for explicit lifecycle control.
+        """
+        await self.__aexit__(None, None, None)
 
     def _require_running(self) -> str:
         """Assert the container is running and return its ID.
@@ -396,6 +416,30 @@ class DockerSandbox:
         )
 
         return result
+
+    async def run_command_simple(
+        self,
+        cmd: str | Sequence[str],
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str, str]:
+        """Execute command and return tuple instead of ExecResult.
+
+        Convenience method matching SandboxProtocol interface.
+
+        Args:
+            cmd: Command to execute.
+            cwd: Working directory.
+            timeout: Timeout in seconds.
+            env: Environment variables.
+
+        Returns:
+            Tuple of (exit_code, stdout, stderr).
+        """
+        result = await self.run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+        return (result.exit_code, result.stdout, result.stderr)
 
     async def install_dependencies(
         self,
@@ -597,6 +641,37 @@ class DockerSandbox:
     def commit(self) -> str | None:
         """Get the checked out commit, if set."""
         return self._state.commit
+
+    @classmethod
+    async def create(
+        cls,
+        container_name: str,
+        repo_url: str,
+        base_commit: str,
+        language: str = "python",
+    ) -> "DockerSandbox":
+        """Create and start a sandbox with repo at base_commit.
+
+        Factory method for simplified instantiation.
+
+        Args:
+            container_name: Name for the container.
+            repo_url: Repository URL to clone.
+            base_commit: Commit SHA to checkout.
+            language: Programming language (determines image).
+
+        Returns:
+            Running DockerSandbox instance with workspace ready.
+        """
+        from swe_forge.execution.docker_client import DockerClient
+
+        client = DockerClient()
+        image = cls.image_for_language(language)
+        config = SandboxConfig(name=container_name, image=image)
+        sandbox = cls(client, config)
+        await sandbox.start()
+        await sandbox.setup_workspace(repo_url, base_commit)
+        return sandbox
 
     @staticmethod
     def _truncate(s: str, max_len: int) -> str:

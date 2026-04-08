@@ -587,7 +587,8 @@ class TestAutoCompaction:
         assert loop.should_compact() is True
         assert loop._max_context_tokens == 200000
 
-    def test_compact_uses_structured_template(self):
+    @pytest.mark.asyncio
+    async def test_compact_uses_structured_template(self):
         """Verify compact uses structured summary template."""
         loop = AgenticLoop(max_context_tokens=1000, keep_last_n=2)
         loop.add_system("System prompt")
@@ -601,7 +602,7 @@ class TestAutoCompaction:
         list(loop.messages)
 
         # Perform compaction without LLM client
-        loop.compact()
+        await loop.compact()
 
         # Find the summary message
         summary_msg = None
@@ -615,7 +616,8 @@ class TestAutoCompaction:
         # The summary should exist (fallback without LLM)
         assert summary_msg is not None
 
-    def test_compact_large_context(self):
+    @pytest.mark.asyncio
+    async def test_compact_large_context(self):
         """Test compaction with 200k+ tokens of history."""
         loop = AgenticLoop(max_context_tokens=200000, keep_last_n=10)
         loop.add_system("System prompt for testing")
@@ -636,7 +638,7 @@ class TestAutoCompaction:
         original_message_count = len(loop.messages)
 
         # Perform compaction
-        tokens_saved = loop.compact()
+        tokens_saved = await loop.compact()
 
         # Verify compaction happened
         assert tokens_saved > 0

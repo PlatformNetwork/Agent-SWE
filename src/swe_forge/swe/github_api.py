@@ -219,18 +219,37 @@ class GitHubClient:
 
     BASE_URL = "https://api.github.com"
 
-    def __init__(self, token: str, timeout: float = 30.0) -> None:
+    OXYLABS_URL = "https://realtime.oxylabs.io/v1/queries"
+    def __init__(
+        self,
+        token: str = "",
+        timeout: float = 30.0,
+        oxylabs_username: str = "",
+        oxylabs_password: str = "",
+        oxylabs_rps: int = 40,
+    ) -> None:
         """Initialize the GitHub client.
 
         Args:
-            token: GitHub personal access token.
+            token: GitHub personal access token (not needed with Oxylabs).
             timeout: Request timeout in seconds.
+            oxylabs_username: Oxylabs proxy username (enables proxy mode).
+            oxylabs_password: Oxylabs proxy password.
+            oxylabs_rps: Oxylabs max requests per second.
         """
         self.token = token
         self.timeout = timeout
         self._session: aiohttp.ClientSession | None = None
         self._rate_limit_info: RateLimitInfo | None = None
-        self._rate_limit_remaining: int = 5000  # Track remaining API calls
+        self._rate_limit_remaining: int = 5000
+        self._oxylabs_username = oxylabs_username
+        self._oxylabs_password = oxylabs_password
+        self._use_oxylabs = bool(oxylabs_username and oxylabs_password)
+        self._oxylabs_rps = oxylabs_rps
+        self._oxylabs_tokens: float = float(oxylabs_rps)
+        self._oxylabs_last_refill: float = 0.0
+        self._oxylabs_lock: asyncio.Lock | None = None
+        self._oxylabs_sem: asyncio.Semaphore | None = None
 
     def _headers(
         self, accept: str = "application/vnd.github.v3+json"
@@ -245,9 +264,10 @@ class GitHubClient:
 
     async def __aenter__(self) -> "GitHubClient":
         """Create aiohttp session on context entry."""
+        session_headers = {} if self._use_oxylabs else self._headers()
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout),
-            headers=self._headers(),
+            headers=session_headers,
         )
         return self
 
@@ -285,6 +305,118 @@ class GitHubClient:
                 await asyncio.sleep(wait_seconds)
                 raise RateLimitError(reset_time)
 
+    async def _oxylabs_acquire(self) -> None:
+        """Token-bucket rate limiter with concurrency cap.
+
+        Ensures no more than oxylabs_rps requests start per second,
+        even when hundreds of coroutines are waiting.
+        """
+        if self._oxylabs_lock is None:
+            self._oxylabs_lock = asyncio.Lock()
+        while True:
+            async with self._oxylabs_lock:
+                now = time.time()
+                if self._oxylabs_last_refill == 0.0:
+                    self._oxylabs_last_refill = now
+                elapsed = now - self._oxylabs_last_refill
+                self._oxylabs_tokens = min(
+                    float(self._oxylabs_rps),
+                    self._oxylabs_tokens + elapsed * self._oxylabs_rps,
+                )
+                self._oxylabs_last_refill = now
+                if self._oxylabs_tokens >= 1.0:
+                    self._oxylabs_tokens -= 1.0
+                    return
+                # Calculate exact wait time for next token
+                wait = (1.0 - self._oxylabs_tokens) / self._oxylabs_rps
+            # Sleep OUTSIDE the lock so other coroutines can check too
+            await asyncio.sleep(wait)
+
+    async def _request_via_oxylabs(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> tuple[int, dict[str, str], str]:
+        """Route a GitHub API request through Oxylabs proxy.
+
+        Rate-limited to oxylabs_rps requests/second (token bucket + semaphore)
+        with automatic retry+backoff on 429.
+        """
+        session = self._get_session()
+
+        if "params" in kwargs:
+            from urllib.parse import urlencode
+            url = f"{url}?{urlencode(kwargs.pop('params'))}"
+
+        payload = {"source": "universal", "url": url}
+        auth = aiohttp.BasicAuth(self._oxylabs_username, self._oxylabs_password)
+
+        if self._oxylabs_sem is None:
+            self._oxylabs_sem = asyncio.Semaphore(self._oxylabs_rps)
+
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                async with self._oxylabs_sem:
+                    await self._oxylabs_acquire()
+                    async with session.post(
+                        self.OXYLABS_URL, json=payload, auth=auth, timeout=aiohttp.ClientTimeout(total=60),
+                    ) as response:
+                        if response.status in (429, 502, 503, 504):
+                            wait = 2 ** attempt
+                            logger.warning(
+                                "Oxylabs %d, retry %d/%d in %ds",
+                                response.status, attempt + 1, max_retries, wait,
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+
+                        if response.status != 200:
+                            text = await response.text()
+                            logger.warning(
+                                "Oxylabs request failed (status=%d): %s",
+                                response.status, text[:200],
+                            )
+                            raise GitHubApiError(
+                                f"Oxylabs proxy error {response.status}", response.status
+                            )
+
+                        data = await response.json()
+                        results = data.get("results", [])
+                        if not results:
+                            raise GitHubApiError("Oxylabs returned no results", 502)
+
+                        content = results[0].get("content", "")
+                        status_code = results[0].get("status_code", 200)
+
+                        if status_code == 404:
+                            raise NotFoundError(f"Resource not found: {url}")
+                        if status_code == 403:
+                            raise ForbiddenError(f"Forbidden: {url}")
+                        if status_code == 406:
+                            raise DiffTooLargeError(f"Diff too large: {url}")
+                        if status_code >= 500:
+                            raise ServerError(status_code, f"Server error via Oxylabs: {url}")
+                        if status_code != 200:
+                            raise GitHubApiError(
+                                f"HTTP {status_code} via Oxylabs: {url}", status_code
+                            )
+
+                        return status_code, {}, content
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError, asyncio.TimeoutError) as exc:
+                wait = 2 ** attempt
+                logger.warning(
+                    "Oxylabs connection error (%s), retry %d/%d in %ds",
+                    type(exc).__name__, attempt + 1, max_retries, wait,
+                )
+                if attempt >= max_retries - 1:
+                    raise GitHubApiError(f"Oxylabs connection failed after {max_retries} retries: {exc}", 502)
+                await asyncio.sleep(wait)
+                continue
+
+        raise GitHubApiError(f"Oxylabs max retries exceeded for {url}", 429)
+
     async def _request(
         self,
         method: str,
@@ -292,7 +424,7 @@ class GitHubClient:
         headers: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> tuple[int, dict[str, str], str]:
-        """Make an HTTP request and handle common errors.
+        """Make an HTTP request, routing through Oxylabs if enabled.
 
         Returns:
             Tuple of (status_code, response_headers, response_text).
@@ -303,6 +435,9 @@ class GitHubClient:
             ServerError: For 5xx responses.
             GitHubApiError: For other error responses.
         """
+        if self._use_oxylabs:
+            return await self._request_via_oxylabs(method, url, **kwargs)
+
         session = self._get_session()
         request_headers = headers or self._headers()
 
@@ -958,11 +1093,22 @@ class GitHubClient:
             return 0
 
 
-async def create_client(token: str | None = None) -> GitHubClient:
-    """Create a GitHub client, loading token from environment if not provided.
+async def create_client(
+    token: str | None = None,
+    oxylabs_username: str = "",
+    oxylabs_password: str = "",
+    oxylabs_rps: int = 0,
+) -> GitHubClient:
+    """Create a GitHub client, loading config from environment if not provided.
+
+    When Oxylabs credentials are provided (or found in env), requests are
+    routed through the Oxylabs proxy to avoid GitHub rate limits.
 
     Args:
         token: GitHub token, or None to load from GITHUB_TOKEN env var.
+        oxylabs_username: Oxylabs username, or loaded from OXYLABS_USERNAME.
+        oxylabs_password: Oxylabs password, or loaded from OXYLABS_PASSWORD.
+        oxylabs_rps: Max Oxylabs requests/sec, or loaded from OXYLABS_RPS.
 
     Returns:
         Initialized GitHubClient (caller must close it).
@@ -972,12 +1118,30 @@ async def create_client(token: str | None = None) -> GitHubClient:
     """
     import os
 
-    if not token:
-        token = os.environ.get("GITHUB_TOKEN")
+    if not oxylabs_username:
+        oxylabs_username = os.environ.get("OXYLABS_USERNAME", "")
+    if not oxylabs_password:
+        oxylabs_password = os.environ.get("OXYLABS_PASSWORD", "")
+    if not oxylabs_rps:
+        oxylabs_rps = int(os.environ.get("OXYLABS_RPS", "40"))
+
+    use_oxylabs = bool(oxylabs_username and oxylabs_password)
 
     if not token:
+        token = os.environ.get("GITHUB_TOKEN", "")
+
+    if not token and not use_oxylabs:
         raise ValueError(
-            "GitHub token required. Set GITHUB_TOKEN env var or pass token."
+            "GitHub token required. Set GITHUB_TOKEN env var or configure Oxylabs."
         )
 
-    return GitHubClient(token)
+    client = GitHubClient(
+        token=token,
+        oxylabs_username=oxylabs_username,
+        oxylabs_password=oxylabs_password,
+        oxylabs_rps=oxylabs_rps,
+    )
+    if client._use_oxylabs:
+        logger.info("GitHub client using Oxylabs proxy (%d req/s, no token needed)", oxylabs_rps)
+
+    return client

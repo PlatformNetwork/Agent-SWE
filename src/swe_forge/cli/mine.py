@@ -13,6 +13,10 @@ import os
 from pathlib import Path
 from typing import Annotated, Optional
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import typer
 from rich.console import Console
 from rich.progress import (
@@ -68,7 +72,7 @@ def mine(
             "--target",
             "-t",
             help="Target number of VALID tasks to mine (stops when reached)",
-            min=1,
+            
         ),
     ] = 10,
     limit: Annotated[
@@ -77,7 +81,7 @@ def mine(
             "--limit",
             "-l",
             help="DEPRECATED: Use --target instead. Maximum number of tasks to mine",
-            min=1,
+            
         ),
     ] = 0,
     max_hours: Annotated[
@@ -175,7 +179,7 @@ def mine(
             "--parallel",
             "-p",
             help="Maximum concurrent Docker containers",
-            min=1,
+            
         ),
     ] = 8,
     output_folder: Annotated[
@@ -281,7 +285,7 @@ def mine(
     languages = (
         [language.lower()]
         if language
-        else ["python", "javascript", "typescript", "rust", "go"]
+        else ["python", "rust"]
     )
     difficulty_filter = difficulty.lower() if difficulty else None
 
@@ -308,6 +312,9 @@ def mine(
     )
 
     github_token = os.environ.get("GITHUB_TOKEN", "")
+    oxylabs_user = os.environ.get("OXYLABS_USERNAME", "")
+    oxylabs_pass = os.environ.get("OXYLABS_PASSWORD", "")
+    oxylabs_rps = int(os.environ.get("OXYLABS_RPS", "40"))
 
     console.print("[bold blue]SWE-Forge Mine Configuration[/bold blue]")
     console.print(f"  Repository: {repo or 'All repositories (from GH Archive)'}")
@@ -329,6 +336,8 @@ def mine(
         console.print(f"  Skip Duplicates: Yes")
         if hf_dataset:
             console.print(f"  HF Dataset: {hf_dataset}")
+    if oxylabs_user:
+        console.print(f"  Oxylabs Proxy: Enabled ({oxylabs_rps} req/s)")
     console.print()
 
     # Run the pipeline
@@ -343,43 +352,20 @@ def mine(
                 skip_duplicates=skip_duplicates,
                 hf_dataset=hf_dataset,
                 cache_dir=cache_dir,
+                oxylabs_username=oxylabs_user,
+                oxylabs_password=oxylabs_pass,
+                oxylabs_rps=oxylabs_rps,
+                output_folder=output_folder,
+                docker_username=docker_username,
+                build_docker=build_docker,
+                docker_push=docker_push,
             )
         )
 
         if result.tasks:
-            # Export to workspace format only
-            from swe_forge.export.workspace import export_tasks_to_workspace
-
-            export_tasks_to_workspace(
-                result.tasks, output_folder, docker_username=docker_username
-            )
             console.print(
-                f"\n[green]Exported {len(result.tasks)} tasks to {output_folder}[/green]"
+                f"\n[green]{len(result.tasks)} tasks exported to {output_folder}[/green]"
             )
-
-            # Build Docker images if requested
-            if build_docker and docker_username:
-                console.print("\n[bold]Building Docker images...[/bold]")
-                build_results = asyncio.run(
-                    _build_docker_images(
-                        result.tasks,
-                        docker_username,
-                        push=docker_push,
-                        parallel=min(parallel, 4),  # Limit parallel builds
-                        verbose=verbose,
-                    )
-                )
-                successful = sum(1 for r in build_results if r.success)
-                console.print(
-                    f"[green]Built {successful}/{len(build_results)} images[/green]"
-                )
-
-                # Update workspace exports with pre-built image info
-                for task, build_result in zip(result.tasks, build_results):
-                    if build_result.success and build_result.image_name:
-                        _update_workspace_docker(
-                            output_folder, task.id, build_result.image_name
-                        )
 
             # Print summary
             if result.benchmark_metrics:
@@ -473,6 +459,76 @@ def _update_workspace_docker(
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
 
+async def _build_and_verify_task(
+    task_dir: Path,
+    docker_username: str,
+    *,
+    push: bool = False,
+    max_repair: int = 5,
+    llm_client: "OpenRouterClient | None" = None,
+    model: str = "openai/gpt-5.4",
+) -> bool:
+    """Build Docker image, verify with repair loop, optionally push.
+
+    Returns True if image was successfully built and verified.
+    """
+    import yaml
+    from swe_forge.publish.docker_builder import (
+        build_docker_image,
+        verify_with_repair,
+        verify_docker_image,
+    )
+
+    workspace_path = task_dir / "workspace.yaml"
+    if not workspace_path.exists():
+        logger.warning(f"No workspace.yaml in {task_dir}")
+        return False
+
+    with open(workspace_path) as f:
+        workspace = yaml.safe_load(f)
+
+    task_id = task_dir.name
+    result = await build_docker_image(task_dir, docker_username, push=False)
+    if not result.success:
+        logger.warning(f"Docker build failed for {task_id}: {result.error}")
+        return False
+
+    image_name = result.image_name
+    logger.info(f"Built image {image_name}, verifying...")
+
+    if llm_client:
+        verify_result = await verify_with_repair(
+            image_name=image_name,
+            workspace=workspace,
+            llm_client=llm_client,
+            max_retries=max_repair,
+            model=model,
+        )
+    else:
+        vr = await verify_docker_image(image_name, workspace)
+        from dataclasses import dataclass
+        verify_result = type("R", (), {"success": vr.success, "repair_attempts": []})()
+
+    if not verify_result.success:
+        logger.warning(f"Docker verification failed for {task_id} after {len(verify_result.repair_attempts)} repairs")
+        return False
+
+    logger.info(f"Docker verified for {task_id} ({len(verify_result.repair_attempts)} repairs)")
+
+    if push:
+        import subprocess
+        push_result = subprocess.run(
+            ["docker", "push", image_name],
+            capture_output=True, text=True, timeout=300,
+        )
+        if push_result.returncode != 0:
+            logger.warning(f"Docker push failed for {task_id}: {push_result.stderr[:200]}")
+            return False
+        logger.info(f"Pushed {image_name}")
+
+    return True
+
+
 async def _run_pipeline(
     token: str,
     config: SwePipelineConfig,
@@ -483,6 +539,13 @@ async def _run_pipeline(
     skip_duplicates: bool = False,
     hf_dataset: Optional[str] = None,
     cache_dir: Optional[str] = None,
+    oxylabs_username: str = "",
+    oxylabs_password: str = "",
+    oxylabs_rps: int = 40,
+    output_folder: Path | None = None,
+    docker_username: str | None = None,
+    build_docker: bool = False,
+    docker_push: bool = False,
 ):
     from dataclasses import dataclass, field
     from pathlib import Path
@@ -497,8 +560,9 @@ async def _run_pipeline(
     test_generator = None
     if openrouter_key:
         llm_client = OpenRouterClient(api_key=openrouter_key, default_model=model)
-        test_generator = TestGenerator(llm=llm_client, model=model)
+        test_generator = TestGenerator(llm=llm_client, model=model, max_turns=500)
         config.test_generator = test_generator
+        config.concurrency_deep = 2
 
     if skip_duplicates:
         from swe_forge.swe.dedup import DedupManager, HuggingFaceDatasetCache
@@ -517,7 +581,12 @@ async def _run_pipeline(
 
         config.dedup_manager = DedupManager(pr_cache=pr_cache, hf_cache=hf_cache)
 
-    async with GitHubClient(token=token) as gh_client:
+    async with GitHubClient(
+        token=token,
+        oxylabs_username=oxylabs_username,
+        oxylabs_password=oxylabs_password,
+        oxylabs_rps=oxylabs_rps,
+    ) as gh_client:
         gh_archive_client = GhArchiveClient(token=token) if not repo_filter else None
 
         tasks: list[SweTask] = []
@@ -559,8 +628,39 @@ async def _run_pipeline(
 
                     elif event.event_type == SwePipelineEventType.TASK_EXTRACTED:
                         task = event.data.get("task")
-                        if task and isinstance(task, SweTask):
+                        if task and isinstance(task, SweTask) and task.quality_passed:
                             tasks.append(task)
+                            if output_folder:
+                                from swe_forge.export.workspace import export_task_to_workspace
+                                result_dir = export_task_to_workspace(
+                                    task, output_folder,
+                                    docker_username=docker_username,
+                                    overwrite=True,
+                                )
+                                if result_dir:
+                                    console.print(
+                                        f"  [green]>> {task.id}[/green] exported to {result_dir}"
+                                    )
+                                    if build_docker and docker_username and llm_client:
+                                        console.print(
+                                            f"  [cyan]Agent setting up Docker for {task.id}...[/cyan]"
+                                        )
+                                        from swe_forge.agents.docker_setup_agent import DockerSetupAgent
+                                        agent = DockerSetupAgent(llm_client, model=model, max_turns=100)
+                                        image = await agent.setup_and_verify(
+                                            result_dir,
+                                            docker_username,
+                                            push=docker_push,
+                                        )
+                                        if image:
+                                            console.print(
+                                                f"  [green]>> {task.id}[/green] Docker image ready: {image}"
+                                                + (" (pushed)" if docker_push else "")
+                                            )
+                                        else:
+                                            console.print(
+                                                f"  [red]>> {task.id}[/red] Docker agent failed"
+                                            )
 
                     elif event.event_type == SwePipelineEventType.PIPELINE_COMPLETED:
                         metrics = event.data.get("metrics")
@@ -622,20 +722,52 @@ def mine_complete(
             help="Enable verbose logging",
         ),
     ] = False,
+    max_repair: Annotated[
+        int,
+        typer.Option(
+            "--max-repair",
+            help="Maximum automatic repair attempts (default: 5)",
+        ),
+    ] = 5,
+    docker_user: Annotated[
+        str | None,
+        typer.Option(
+            "--docker-user",
+            "-d",
+            help="Docker Hub username for build+push",
+        ),
+    ] = None,
+    push: Annotated[
+        bool,
+        typer.Option(
+            "--push",
+            help="Push Docker image to registry",
+        ),
+    ] = False,
 ) -> None:
-    """Complete A-Z mining with Docker verification.
+    """Complete A-Z mining with Docker verification and auto-repair.
 
-    Runs the full pipeline:
+    Runs the full pipeline with AUTOMATIC REPAIR:
     1. Fetch PR from GitHub
     2. Detect language
     3. Discover commands from CI/CD
     4. Generate tests via LLM
-    5. Verify tests fail before patch
-    6. Apply patch
-    7. Verify tests pass after patch
-    8. Export validated task
-
-    Only exports if ALL verification checks pass.
+    5. Verify tests fail before patch (FAIL→PASS)
+    6. If tests don't fail/pass correctly: AUTO-REPAIR (up to --max-repair times)
+    7. Build Docker image (if --docker-user)
+    8. Verify in Docker with repair loop
+    9. Push to Docker Hub (if --push)
+    10. Export validated task
+    
+    NO HUMAN INTERVENTION - everything is autonomous!
+    
+    Examples:
+        # Full autonomous pipeline
+        swe-forge mine complete --repo python/cpython --pr 132391 \
+            --docker-user platformnetwork --push
+        
+        # With custom repair attempts
+        swe-forge mine complete --repo django/django --pr 19171 --max-repair 10
     """
     log_level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -643,8 +775,11 @@ def mine_complete(
     )
 
     github_token = os.environ.get("GITHUB_TOKEN", "")
-    if not github_token:
-        console.print("[red]Error: GITHUB_TOKEN environment variable not set[/red]")
+    oxylabs_user = os.environ.get("OXYLABS_USERNAME", "")
+    oxylabs_pass = os.environ.get("OXYLABS_PASSWORD", "")
+
+    if not github_token and not (oxylabs_user and oxylabs_pass):
+        console.print("[red]Error: Set GITHUB_TOKEN or OXYLABS_USERNAME/OXYLABS_PASSWORD[/red]")
         raise typer.Exit(code=1)
 
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -654,12 +789,16 @@ def mine_complete(
     console.print(f"  PR: #{pr}")
     console.print(f"  Model: {llm_model}")
     console.print(f"  Output: {output}")
+    if oxylabs_user:
+        console.print(f"  Oxylabs Proxy: Enabled")
     console.print()
 
     try:
         result = asyncio.run(
             _run_complete_mining(
-                repo, pr, output, llm_model, github_token, openrouter_key
+                repo, pr, output, llm_model, github_token, openrouter_key,
+                max_repair=max_repair, docker_user=docker_user, push=push,
+                oxylabs_username=oxylabs_user, oxylabs_password=oxylabs_pass,
             )
         )
 
@@ -691,32 +830,97 @@ async def _run_complete_mining(
     model: str,
     github_token: str,
     openrouter_key: str,
+    *,
+    max_repair: int = 5,
+    docker_user: str | None = None,
+    push: bool = False,
+    oxylabs_username: str = "",
+    oxylabs_password: str = "",
 ):
-    """Run the complete mining pipeline."""
+    """Run the complete mining pipeline with automatic repair."""
     from swe_forge.pipeline import CompleteMiningPipeline
+    from swe_forge.publish.docker_builder import build_docker_image, verify_with_repair
+    from pathlib import Path
+    import yaml
 
     llm_client = None
     if openrouter_key:
         llm_client = OpenRouterClient(api_key=openrouter_key, default_model=model)
 
-    async with GitHubClient(token=github_token) as gh:
+    async with GitHubClient(
+        token=github_token,
+        oxylabs_username=oxylabs_username,
+        oxylabs_password=oxylabs_password,
+    ) as gh:
         pipeline = CompleteMiningPipeline(
             gh_client=gh,
             llm_client=llm_client,
             model=model,
         )
 
-        result = await pipeline.mine_pr(repo, pr_number)
+        # Step 1: Mine and verify with repair loop
+        console.print("[cyan]Step 1: Mining and test generation (with auto-repair)...[/cyan]")
+        result = await pipeline.mine_pr(repo, pr_number, max_repair_attempts=max_repair)
 
-        if result:
-            from pathlib import Path
-            from swe_forge.export.workspace import export_task_to_workspace
+        if not result:
+            console.print("[red]Failed after repair attempts[/red]")
+            return None
 
-            # Export to workspace format
-            output_dir = Path(output).parent if Path(output).suffix else Path(output)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            export_task_to_workspace(result.task, output_dir)
-            console.print(f"[green]Exported to: {output_dir / result.task.id}[/green]")
+        # Step 2: Export workspace
+        console.print("[cyan]Step 2: Exporting workspace...[/cyan]")
+        output_dir = Path(output).parent if Path(output).suffix else Path(output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        from swe_forge.export.workspace import export_task_to_workspace
+        task_dir = export_task_to_workspace(result.task, output_dir, docker_user)
+        console.print(f"[green]Exported to: {task_dir}[/green]")
+
+        # Step 3: Build Docker image (if requested)
+        if docker_user:
+            console.print("[cyan]Step 3: Building Docker image...[/cyan]")
+            try:
+                image_name = await build_docker_image(task_dir, docker_user, push=False)
+                console.print(f"[green]Built image: {image_name}[/green]")
+                
+                # Step 4: Verify in Docker with repair loop
+                console.print(f"[cyan]Step 4: Verifying in Docker (max {max_repair} repairs)...[/cyan]")
+                
+                workspace_file = task_dir / "workspace.yaml"
+                with open(workspace_file) as f:
+                    workspace = yaml.safe_load(f)
+                
+                verify_result = await verify_with_repair(
+                    image_name=image_name,
+                    workspace=workspace,
+                    llm_client=llm_client,
+                    max_retries=max_repair,
+                    model=model,
+                )
+                
+                if verify_result.success:
+                    repairs = len(verify_result.repair_attempts)
+                    console.print(f"[green]Verified in Docker ({repairs} repairs)[/green]")
+                    
+                    # Step 5: Push if requested
+                    if push:
+                        console.print("[cyan]Step 5: Pushing to Docker Hub...[/cyan]")
+                        import subprocess
+                        push_result = subprocess.run(
+                            ["docker", "push", image_name],
+                            capture_output=True,
+                            text=True,
+                        )
+                        if push_result.returncode == 0:
+                            console.print(f"[green]Pushed: {image_name}[/green]")
+                        else:
+                            console.print(f"[red]Push failed: {push_result.stderr}[/red]")
+                else:
+                    console.print(f"[red]Docker verification failed after {len(verify_result.repair_attempts)} repairs[/red]")
+                    return None
+                    
+            except Exception as e:
+                console.print(f"[red]Docker build/verify failed: {e}[/red]")
+                logger.error(f"Docker error: {e}")
 
         return result
 

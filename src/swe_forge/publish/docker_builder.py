@@ -244,32 +244,33 @@ def _validate_pre_apply_with_retry(
 
 
 def _copy_tests_to_repo(container_name: str) -> None:
-    """Copy tests from /workspace/tests/ to /repo/tests/ with correct paths."""
+    """Copy tests from /workspace/tests/ to /repo/ with correct paths."""
     script = """
 set -e
 cd /repo
 
+# Copy files preserving directory structure (handles nested tests/tests/ etc.)
+find /workspace/tests -name '*.py' -type f | while read -r f; do
+    rel="${f#/workspace/tests/}"
+    target_dir=$(dirname "$rel")
+    mkdir -p "$target_dir"
+    cp "$f" "$rel"
+done
+
+# Also handle flat files with underscore-encoded paths (legacy)
 for f in /workspace/tests/*.py; do
-    if [ -f "$f" ]; then
-        basename=$(basename "$f")
-        name="${basename%.py}"
-        
-        if [[ "$name" =~ ^tests_(.*)_test_(.*)$ ]]; then
-            dir_part="${BASH_REMATCH[1]}"
-            file_part="test_${BASH_REMATCH[2]}"
-            target_dir="tests/${dir_part//_//}"
-            target_file="$target_dir/${file_part}.py"
-        elif [[ "$name" =~ ^tests_test_(.*)$ ]]; then
-            file_part="${BASH_REMATCH[1]}"
-            target_dir="tests"
-            target_file="$target_dir/test_${file_part}.py"
-        else
-            target_dir="tests"
-            target_file="tests/$basename"
-        fi
-        
+    [ -f "$f" ] || continue
+    basename=$(basename "$f")
+    name="${basename%.py}"
+    if [[ "$name" =~ ^tests_(.*)_test_(.*)$ ]]; then
+        dir_part="${BASH_REMATCH[1]}"
+        file_part="test_${BASH_REMATCH[2]}"
+        target_dir="tests/${dir_part//_//}"
         mkdir -p "$target_dir"
-        cp "$f" "$target_file"
+        cp "$f" "$target_dir/${file_part}.py"
+    elif [[ "$name" =~ ^tests_test_(.*)$ ]]; then
+        mkdir -p tests
+        cp "$f" "tests/test_${BASH_REMATCH[1]}.py"
     fi
 done
 """
@@ -472,9 +473,6 @@ def _generate_dockerfile(workspace: dict, task_dir: Path | None = None) -> str:
                 'ENV PATH="$VIRTUAL_ENV/bin:$PATH"',
             ]
         )
-        for cmd in install_commands:
-            if cmd and not cmd.startswith("#"):
-                lines.append(f"RUN {cmd}")
     elif language in ("javascript", "typescript"):
         lines.extend(
             [
@@ -482,9 +480,6 @@ def _generate_dockerfile(workspace: dict, task_dir: Path | None = None) -> str:
                 "RUN npm install -g pnpm || true",
             ]
         )
-        for cmd in install_commands:
-            if cmd:
-                lines.append(f"RUN {cmd}")
     elif language == "go":
         lines.append("RUN apt-get update && apt-get install -y golang-go")
     elif language == "rust":
@@ -508,12 +503,18 @@ def _generate_dockerfile(workspace: dict, task_dir: Path | None = None) -> str:
         if base_commit:
             lines.append(f"RUN git checkout {base_commit}")
 
-    # Add workspace directory with tests
+    # Install commands AFTER repo is cloned
+    if install_commands:
+        for cmd in install_commands:
+            if cmd and not cmd.strip().startswith("#"):
+                lines.append(f"RUN cd /repo && {cmd}")
+
+    # Add workspace directory and symlink /workspace/repo -> /repo
     lines.extend(
         [
             "",
-            "# Create workspace directory with tests",
             "RUN mkdir -p /workspace/tests",
+            "RUN ln -sf /repo /workspace/repo",
             "WORKDIR /repo",
         ]
     )
@@ -555,12 +556,10 @@ async def build_docker_image(
             tests_build = workspace_build / "tests"
             tests_build.mkdir()
 
-            # Copy tests directory if exists
+            # Copy tests directory recursively (preserves subdirectory structure)
             tests_src = task_dir / "tests"
             if tests_src.exists() and tests_src.is_dir():
-                for test_file in tests_src.iterdir():
-                    if test_file.is_file():
-                        shutil.copy(test_file, tests_build / test_file.name)
+                shutil.copytree(tests_src, tests_build, dirs_exist_ok=True)
 
             # Copy workspace.yaml
             shutil.copy(workspace_path, workspace_build / "workspace.yaml")
@@ -605,7 +604,7 @@ RUN chmod +x /workspace/run_tests.sh
 
             if result.returncode != 0:
                 error_msg = (
-                    result.stderr[:500] if result.stderr else "Unknown build error"
+                    result.stderr[-2000:] if result.stderr else "Unknown build error"
                 )
                 return BuildResult(
                     success=False, task_id=task_id, error=f"Build failed: {error_msg}"

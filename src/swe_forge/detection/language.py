@@ -382,8 +382,19 @@ def detect_language(files: dict[str, str]) -> Language:
     return Language.UNKNOWN
 
 
+CONFIG_LANGUAGES = frozenset(
+    {
+        Language.MARKDOWN,
+        Language.YAML,
+        Language.JSON,
+    }
+)
+
+
 def detect_language_from_files(filenames: list[str]) -> Language:
     """Detect language from list of filenames.
+
+    Prioritizes programming languages over config languages (YAML/JSON/Markdown).
 
     Args:
         filenames: List of filenames to check.
@@ -392,14 +403,21 @@ def detect_language_from_files(filenames: list[str]) -> Language:
         Detected Language, or Language.UNKNOWN if not detected.
 
     Example:
-        >>> detect_language_from_files(["Cargo.toml", "src/main.rs"])
-        <Language.RUST: 'rust'>
+        >>> detect_language_from_files([".pre-commit-config.yaml", "setup.py"])
+        <Language.PYTHON: 'python'>  # Python detected, not YAML
     """
+    result = Language.UNKNOWN
+
     for filename in filenames:
         language = _detect_language_from_filename(filename)
-        if language != Language.UNKNOWN:
+        if language == Language.UNKNOWN:
+            continue
+        if language not in CONFIG_LANGUAGES:
             return language
-    return Language.UNKNOWN
+        if result == Language.UNKNOWN:
+            result = language
+
+    return result
 
 
 def _detect_language_from_filename(filename: str) -> Language:

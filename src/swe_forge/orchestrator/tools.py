@@ -142,8 +142,11 @@ async def generate_tests(
     )
 
     # If no sandbox provided, create a Docker-based one
-    if sandbox is None:
-        sandbox = await _create_docker_sandbox(repo_url, base_commit, task_id)
+    sandbox_created_internally = sandbox is None
+    if sandbox_created_internally:
+        sandbox = await _create_docker_sandbox(
+            repo_url, base_commit, task_id, language=language
+        )
 
     generator = TestGenerator(
         llm=llm_client,
@@ -173,6 +176,12 @@ async def generate_tests(
             success=False,
             error=str(e),
         )
+    finally:
+        if sandbox_created_internally and sandbox is not None:
+            try:
+                await sandbox.stop()
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to stop sandbox: {cleanup_error}")
 
 
 async def validate_tests(
@@ -702,117 +711,17 @@ async def _create_docker_sandbox(
     repo_url: str,
     base_commit: str,
     task_id: str,
+    language: str = "python",
 ) -> "DockerSandbox":
     """Create a Docker-based sandbox for test generation."""
-    return DockerSandbox(repo_url=repo_url, base_commit=base_commit, task_id=task_id)
+    from swe_forge.execution.sandbox import DockerSandbox as RealDockerSandbox
 
+    container_name = f"swe-gen-{task_id.replace('/', '-').replace('.', '-')}"
 
-@dataclass
-class DockerSandbox:
-    """Docker-based sandbox for test generation."""
-
-    repo_url: str
-    base_commit: str
-    task_id: str
-    container_name: str = ""
-    container_id: str | None = None
-    _started: bool = field(default=False, init=False)
-
-    async def _ensure_container(self) -> None:
-        """Start Docker container if not already running."""
-        if self._started:
-            return
-
-        self.container_name = (
-            f"swe-gen-{self.task_id.replace('/', '-').replace('.', '-')}"
-        )
-
-        # Remove existing container if any
-        subprocess.run(
-            ["docker", "rm", "-f", self.container_name],
-            capture_output=True,
-            text=True,
-        )
-
-        # Start new container
-        result = subprocess.run(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--name",
-                self.container_name,
-                "ubuntu:24.04",
-                "sleep",
-                "3600",  # Keep alive for 1 hour
-            ],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to start container: {result.stderr}")
-
-        self.container_id = result.stdout.strip()
-        self._started = True
-
-        # Install dependencies
-        await self.run_command(
-            "apt-get update && apt-get install -y git python3 python3-pip python3-venv"
-        )
-        await self.run_command("git clone {self.repo_url} /repo")
-        await self.run_command(f"cd /repo && git checkout {self.base_commit}")
-
-    async def run_command(
-        self, cmd: str, *, timeout: float | None = None
-    ) -> "ExecResult":
-        """Execute a command in the Docker container."""
-        await self._ensure_container()
-
-        timeout_sec = timeout or 120
-
-        result = subprocess.run(
-            ["docker", "exec", self.container_name, "bash", "-lc", cmd],
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-        )
-
-        return ExecResult(
-            exit_code=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
-
-    async def write_file(self, path: str, content: str) -> None:
-        """Write a file in the container."""
-        await self._ensure_container()
-
-        # Use heredoc for multi-line content
-        escaped_content = content.replace("'", "'\"'\"'")
-        await self.run_command(f"cat > {path} << 'EOFMARKER'\n{content}\nEOFMARKER")
-
-    async def read_file(self, path: str) -> str:
-        """Read a file from the container."""
-        await self._ensure_container()
-        result = await self.run_command(f"cat {path}")
-        return result.stdout
-
-    async def cleanup(self) -> None:
-        """Remove the Docker container."""
-        if self.container_name:
-            subprocess.run(
-                ["docker", "rm", "-f", self.container_name],
-                capture_output=True,
-                text=True,
-            )
-            self._started = False
-
-
-@dataclass
-class ExecResult:
-    """Result from a command execution in the sandbox."""
-
-    exit_code: int
-    stdout: str
-    stderr: str
+    sandbox = await RealDockerSandbox.create(
+        container_name=container_name,
+        repo_url=repo_url,
+        base_commit=base_commit,
+        language=language,
+    )
+    return sandbox

@@ -593,7 +593,7 @@ class TestTestGenerator:
 
         assert generator._max_turns == MAX_AGENT_TURNS
         assert generator._temperature == 0.2
-        assert generator._max_tokens == 2000
+        assert generator._max_tokens == 4096
 
     def test_test_generator_custom_values(self):
         mock_llm = MagicMock()

@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import base64
 from typing import TYPE_CHECKING, Any
 
 from swe_forge.detection import detect_language_from_files
@@ -26,6 +27,7 @@ from swe_forge.discovery import AgenticCommandDiscovery
 from swe_forge.execution.docker_client import DockerClient
 from swe_forge.execution.sandbox import DockerSandbox, SandboxConfig
 from swe_forge.export.jsonl import export_jsonl
+from swe_forge.publish.docker_builder import verify_with_repair
 from swe_forge.swe.github_api import GitHubClient, PullRequest, PRFile
 from swe_forge.swe.models import SweTask, SweTaskStatus
 from swe_forge.swe.test_generator import GeneratedTests, TestGenerator
@@ -115,17 +117,19 @@ class CompleteMiningPipeline:
         self,
         repo: str,
         pr_number: int,
+        max_repair_attempts: int = 5,
     ) -> ValidatedTask | None:
-        """Mine a single PR through the complete A-Z pipeline.
+        """Mine a single PR through the complete A-Z pipeline with auto-repair.
 
         Args:
             repo: Repository in owner/repo format
             pr_number: Pull request number
+            max_repair_attempts: Maximum automatic repair attempts (default: 5)
 
         Returns:
             ValidatedTask if all checks pass, None otherwise
         """
-        result = await self._run_pipeline(repo, pr_number)
+        result = await self._run_pipeline(repo, pr_number, max_repair_attempts=max_repair_attempts)
         return result.validated_task
 
     async def verify_task(self, task: SweTask) -> bool:
@@ -161,8 +165,14 @@ class CompleteMiningPipeline:
             if self._own_docker and docker_client:
                 pass  # DockerClient context handles cleanup
 
-    async def _run_pipeline(self, repo: str, pr_number: int) -> PipelineResult:
-        """Execute the full pipeline for a single PR."""
+    async def _run_pipeline(
+        self, 
+        repo: str, 
+        pr_number: int,
+        *,
+        max_repair_attempts: int = 5,
+    ) -> PipelineResult:
+        """Execute the full pipeline for a single PR with auto-repair."""
 
         # Stage 1: Fetch PR
         pr, files, diff = await self._fetch_pr(repo, pr_number)
@@ -242,7 +252,7 @@ class CompleteMiningPipeline:
                 language_detected=language.value,
             )
 
-        verification_result = await self._run_docker_verification(task)
+        verification_result = await self._run_docker_verification(task, max_repair_attempts=max_repair_attempts)
 
         if verification_result:
             task.status = SweTaskStatus.VALIDATED
@@ -312,6 +322,13 @@ class CompleteMiningPipeline:
                         task.base_commit,
                     )
 
+                    # Create forge directory structure for LLM agent
+                    await sandbox.run_command("mkdir -p /workspace/forge/tests")
+                    # Write patch using base64 to handle special characters
+                    patch_b64 = base64.b64encode(task.patch.encode()).decode()
+                    await sandbox.run_command(f"echo {patch_b64} | base64 -d > /workspace/forge/patch.diff")
+                    logger.info("Created /workspace/forge structure for agent")
+
                     generator = TestGenerator(
                         llm=self.llm_client,
                         model=self.model,
@@ -327,10 +344,18 @@ class CompleteMiningPipeline:
             if self._own_docker:
                 pass
 
-    async def _run_docker_verification(self, task: SweTask) -> ValidatedTask | None:
-        """Run Docker verification: tests must fail before, pass after patch."""
+    async def _run_docker_verification(
+        self, 
+        task: SweTask,
+        max_repair_attempts: int = 5,
+    ) -> ValidatedTask | None:
+        """Run Docker verification: tests must fail before, pass after patch.
+        
+        Uses automatic repair loop if tests fail verification.
+        """
         from swe_forge.docker_test import DockerTestHarness, verify_patch_fixes_issue
         from swe_forge.docker_test.verification import TestFile
+        from swe_forge.publish.docker_builder import VerifyWithRepairResult
 
         docker_client = self.docker_client or DockerClient()
 
@@ -380,13 +405,50 @@ class CompleteMiningPipeline:
                 )
 
                 if verification.passed:
-                    return ValidatedTask(
+                    result = ValidatedTask(
                         task=task,
                         before_tests_passed=verification.before_passed,
                         after_tests_passed=verification.after_passed,
                         before_test_output=verification.before_output,
                         after_test_output=verification.after_output,
                     )
+                    return result
+                
+                # If verification failed and we have LLM, try repair loop
+                if self.llm_client and max_repair_attempts > 0:
+                    logger.info(f"Verification failed, starting repair loop (max {max_repair_attempts} attempts)")
+                    
+                    # Build minimal workspace for repair
+                    workspace = {
+                        "task_id": task.id,
+                        "repo": {"url": f"https://github.com/{task.repo}"},
+                        "patch": task.patch,
+                        "tests": {
+                            "fail_to_pass": task.fail_to_pass,
+                            "pass_to_pass": task.pass_to_pass,
+                        },
+                        "install": {"commands": task.install_config.get("install_commands", [])},
+                    }
+                    
+                    repair_result = await verify_with_repair(
+                        image_name="ubuntu:24.04",  # Will rebuild
+                        workspace=workspace,
+                        llm_client=self.llm_client,
+                        max_retries=max_repair_attempts,
+                        model=self.model,
+                    )
+                    
+                    if repair_result.success:
+                        logger.info(f"Tests fixed after {len(repair_result.repair_attempts)} repair(s)")
+                        return ValidatedTask(
+                            task=task,
+                            before_tests_passed=False,
+                            after_tests_passed=True,
+                            before_test_output="",
+                            after_test_output=f"Repaired after {len(repair_result.repair_attempts)} attempts",
+                        )
+                    else:
+                        logger.warning(f"Repair failed after {len(repair_result.repair_attempts)} attempts")
 
                 return None
         except Exception as e:
