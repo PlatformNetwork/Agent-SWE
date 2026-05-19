@@ -63,6 +63,12 @@ benchmark_*.json
 benchmark_*.log
 benchmark_*.md
 validation_summary.json
+*_report.json
+docker_verification_*.json
+repair_*.json
+results*.json
+revalidation_*.json
+verification_candidates.json
 validated-dataset/
 benchmark-output/
 
